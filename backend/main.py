@@ -24,6 +24,7 @@ from backend import models, schemas, crud, auth, policy_store
 from backend.app_directory import resolve_app, infer_alias_context
 from backend.settings import settings
 from backend.routes_usage_desktop import router as desktop_usage_router
+from backend.routes_apps_alias import router as apps_alias_router
 from backend.metrics import metrics
 from backend.redis_client import redis_client
 from backend.app_seeds import load_app_seeds
@@ -159,6 +160,8 @@ async def get_usage_analytics_public(
 logging.error(f"🔍 DEBUG: Including dashboard router with {len(dashboard_router.routes)} routes")
 app.include_router(dashboard_router)
 logging.error(f"🔍 DEBUG: Dashboard router included successfully")
+# Register apps alias router for client-provided package metadata (labels + icons)
+app.include_router(apps_alias_router)
 
 # DIRECT ROUTE TEST - bypass router completely
 @app.get(f"{API_BASE_PATH}/dashboard/test", tags=["test"])
