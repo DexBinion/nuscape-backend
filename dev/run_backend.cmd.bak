@@ -1,6 +1,6 @@
 @echo off
 cd /d C:\Users\dexte\OneDrive\Desktop\NuScape\NuScapeWeb\NuScapeWeb\NuScapeWeb\NuScapeWeb
-set DATABASE_URL=postgresql://neondb_owner:npg_xEtmMqpFy9b5@ep-polished-surf-ae27e44m.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require
+set DATABASE_URL=postgresql://neondb_owner:npg_GdE6qDcUWk0o@ep-billowing-hall-afggft2d.c-2.us-west-2.aws.neon.tech/neondb?sslmode=require
 set REDIS_URL=redis://localhost:6379
 set JWT_SECRET_KEY=5QX9zN4yr3wWVKvY8v1H5jLk0tPd2sFA
 set API_BASE_PATH=/api/v1
