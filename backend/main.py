@@ -26,6 +26,7 @@ from backend.settings import settings
 from backend.routes_usage_desktop import router as desktop_usage_router
 from backend.routes_apps_alias import router as apps_alias_router
 from backend.routes_usage_summary import router as usage_summary_router
+from backend.routes_usage_debug import router as usage_debug_router
 from backend.metrics import metrics
 from backend.redis_client import redis_client
 from backend.app_seeds import load_app_seeds
@@ -165,6 +166,8 @@ logging.error(f"🔍 DEBUG: Dashboard router included successfully")
 app.include_router(apps_alias_router)
 # Register usage summary endpoints (attention/device/app totals)
 app.include_router(usage_summary_router)
+# Register debug endpoint to echo/validate incoming mobile items (dev only)
+app.include_router(usage_debug_router)
 
 # DIRECT ROUTE TEST - bypass router completely
 @app.get(f"{API_BASE_PATH}/dashboard/test", tags=["test"])
