@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
+import sqlalchemy
 
 # Ensure repository-root .env is loaded before any settings or DB modules import it
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -536,6 +537,34 @@ async def create_usage_batch_tolerant(
     
     # Handle both mobile (items) and server (entries) formats
     raw_items = body_data.get('items') or body_data.get('entries') or body_data.get('sessions') or []
+    # Guardrail: validate mobile-format items require bounded windows (windowStart/windowEnd/totalMs)
+    validated_items = []
+    for i, item in enumerate(raw_items):
+        # Only validate mobile "package" shaped items; server-format entries are validated by Pydantic later
+        if isinstance(item, dict) and 'package' in item:
+            if not item.get('windowStart') or not item.get('windowEnd') or 'totalMs' not in item:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid item at index {i}: require windowStart, windowEnd and totalMs"
+                )
+            # Validate ISO timestamps and cap duration to 8 hours
+            try:
+                s = datetime.fromisoformat(item['windowStart'].replace('Z', '+00:00'))
+                e = datetime.fromisoformat(item['windowEnd'].replace('Z', '+00:00'))
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid ISO timestamps in item at index {i}"
+                )
+            if (e - s).total_seconds() > 8 * 3600:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Item at index {i} exceeds maximum allowed session length"
+                )
+            validated_items.append(item)
+        else:
+            validated_items.append(item)
+    raw_items = validated_items
     usage_entries = []
     
     for item in raw_items:
@@ -574,7 +603,7 @@ async def create_usage_batch_tolerant(
             logging.warning(f"Unknown item format: {item}")
     
     try:
-        # Create usage logs  
+        # Create usage logs
         accepted_count = await crud.create_usage_logs(db, device, usage_entries)
         logging.warning(f"Accepted {accepted_count} usage entries for device {device.name}")
         
@@ -582,6 +611,11 @@ async def create_usage_batch_tolerant(
         await crud.update_device_last_seen(db, device.id)
         
         return schemas.BatchResponse(accepted=accepted_count)
+    except sqlalchemy.exc.IntegrityError as ie:
+        # Duplicate session insert detected due to unique constraint - treat as idempotent success.
+        await db.rollback()
+        logging.warning("Duplicate session insert detected; ignoring duplicates: %s", ie)
+        return schemas.BatchResponse(accepted=0)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
