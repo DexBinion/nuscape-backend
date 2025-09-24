@@ -1,13 +1,13 @@
 from typing import List, Dict
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.auth import verify_device_jwt_auth
-from backend.main import security
 from datetime import datetime
 
 router = APIRouter(prefix="/api/v1/usage", tags=["debug"])
+security = HTTPBearer()
 
 
 @router.post("/debug")
