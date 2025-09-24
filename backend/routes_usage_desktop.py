@@ -1,0 +1,55 @@
+from fastapi import APIRouter, Depends, HTTPException
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY, HTTP_403_FORBIDDEN
+from sqlalchemy.ext.asyncio import AsyncSession
+from backend.database import get_db
+from backend.schemas import DesktopUsageBatch, UsageEntry
+from backend.auth import require_device
+from backend import crud
+import logging
+
+router = APIRouter()
+log = logging.getLogger("usage")
+
+
+@router.post("/api/v1/usage/batch/desktop")
+async def usage_batch_desktop(
+    batch: DesktopUsageBatch,
+    device=Depends(require_device),
+    db: AsyncSession = Depends(get_db)
+):
+    """Accept desktop batch usage logs with unified device JWT authentication."""
+    log.info("desktop batch device=%s entries=%d", device.id, len(batch.entries))
+
+    # Validate device_id matches authenticated device
+    if str(device.id) != str(batch.device_id):
+        raise HTTPException(HTTP_403_FORBIDDEN, "Device ID mismatch")
+
+    entries: list[UsageEntry] = []
+    for entry in batch.entries:
+        if entry.duration < 0 or entry.end < entry.start:
+            raise HTTPException(HTTP_422_UNPROCESSABLE_ENTITY, "Invalid duration or timestamps")
+
+        entries.append(
+            UsageEntry(
+                app_name=entry.app_name,
+                domain=None,
+                start=entry.start,
+                end=entry.end,
+                duration=entry.duration,
+            )
+        )
+
+    accepted = 0
+    if entries:
+        accepted = await crud.create_usage_logs(db, device, entries)
+        total_duration_mins = sum(e.duration for e in entries) // 60
+        log.info(
+            "desktop accepted=%d device=%s total_mins=%d",
+            accepted,
+            device.id,
+            total_duration_mins,
+        )
+
+    return {"accepted": accepted}
+
+

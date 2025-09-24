@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "backend:dev",
+      "type": "shell",
+      "command": "dev\\run_backend.cmd",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "web:dev",
+      "type": "shell",
+      "command": "npm run dev",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "dev:all",
+      "type": "shell",
+      "dependsOn": ["backend:dev", "web:dev"],
+      "problemMatcher": []
+    }
+  ]
+}

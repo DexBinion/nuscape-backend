@@ -1,0 +1,31 @@
+import os
+from typing import Optional
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    # Database
+    database_url: str = os.getenv("DATABASE_URL", "")
+    
+    # Redis
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+    require_redis: bool = os.getenv("REQUIRE_REDIS", "false").lower() == "true"
+    
+    # JWT
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "dev-secret-key")
+    jwt_algorithm: str = "HS256"
+    jwt_expiration_hours: int = 24 * 30  # 30 days
+    
+    # API
+    api_base_path: str = os.getenv("API_BASE_PATH", "/api/v1")
+    rate_limit_rps: int = int(os.getenv("RATE_LIMIT_RPS", "50"))
+    
+    # Queue
+    queue_stream_name: str = "nuscape:events"
+    queue_dlq_name: str = "nuscape:dlq"
+    queue_consumer_group: str = "proc-1"
+    queue_maxlen: int = 1000000
+    
+    class Config:
+        env_file = ".env"
+    
+settings = Settings()

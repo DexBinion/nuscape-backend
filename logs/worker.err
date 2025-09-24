@@ -1,0 +1,4 @@
+2025-09-19 14:24:03,434 - __main__ - INFO - Connected to Redis successfully
+2025-09-19 14:24:04,038 - __main__ - INFO - Connected to PostgreSQL successfully
+2025-09-19 14:24:04,128 - __main__ - INFO - Rollup tables ensured
+2025-09-19 14:24:04,129 - __main__ - INFO - Starting processor with consumer: processor-1758309841

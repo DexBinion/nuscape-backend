@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Smooth fonts and subtle scrollbars */
+:root { color-scheme: dark; }
+* { scrollbar-width: thin; }
+body { @apply antialiased bg-base-bg text-base-text; }
+/* Make cards sit on the same black background, keep subtle border as separator */
+.card { @apply bg-base-bg rounded-2xl border border-base-stroke shadow-soft; }
+.hint { @apply text-base-mute text-sm; }
+.btn { @apply inline-flex items-center gap-2 rounded-xl border border-base-stroke px-3 py-2 hover:bg-base-stroke/40 transition; }
+.btn-primary { @apply bg-base-accent text-white border-transparent hover:opacity-90; }
+.toggle { @apply relative inline-flex h-6 w-11 items-center rounded-full bg-base-stroke; }
+.toggle-dot { @apply inline-block h-4 w-4 transform rounded-full bg-white translate-x-1 transition; }
+.toggle-active { @apply bg-base-accent; }
+.toggle-active .toggle-dot { @apply translate-x-6; }
+

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Flutter
+.dart_tool/
+build/
+**/Flutter/ephemeral/
+**/.plugin_symlinks/
+pubspec.lock
+
+# OS / misc
+.DS_Store
+*.log
+
+# Replit noise
+.local/
+.config/
+attached_assets/
+node_modules
+*.egg-info/
+
+# Local envs
+.env.local
+
+# Editor / IDE
+.vscode/
+
+# Runtime dumps and logs
+dump.rdb
+logs/
+
+# Local redis binaries / artifacts (not needed in repo)
+redis/
