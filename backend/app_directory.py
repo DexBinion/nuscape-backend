@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import base64
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -79,7 +80,32 @@ async def resolve_app(
             raise RuntimeError(f"Alias {alias.id} points to missing app {alias.app_id}")
         return AppResolution(app=app, alias=alias, created_app=False, created_alias=False)
 
-    # Create app if it does not exist
+    # Create app if it does not exist.
+    # First, consult package-level metadata (app_aliases_package) if present for mobile packages.
+    # This restores previous behavior where devices could supply a friendly label/icon for a package.
+    # Prefer package metadata label/icon over the raw display_name passed in (which is often the package).
+    if namespace == "android":
+        try:
+            pkg_stmt = sa.text(
+                "SELECT label, icon_png FROM app_aliases_package WHERE package_name = :pkg LIMIT 1"
+            )
+            pkg_row = (await db.execute(pkg_stmt, {"pkg": ident})).first()
+            if pkg_row:
+                pkg_label = getattr(pkg_row, "label", None) or (pkg_row[0] if len(pkg_row) > 0 else None)
+                pkg_icon_png = getattr(pkg_row, "icon_png", None) or (pkg_row[1] if len(pkg_row) > 1 else None)
+                if pkg_label:
+                    display_name = pkg_label
+                if pkg_icon_png and not icon_b64:
+                    try:
+                        # icon_png is binary bytes in the DB; convert to base64 string for storing on App
+                        icon_b64 = base64.b64encode(pkg_icon_png).decode("ascii")
+                    except Exception:
+                        # best-effort: ignore icon encoding errors
+                        pass
+        except Exception:
+            # Non-fatal: if the metadata table is missing or query fails, continue with fallback
+            pass
+
     display_name = display_name or _fallback_display_name(namespace, ident)
     app_id = await _ensure_app_id(db, display_name)
 
