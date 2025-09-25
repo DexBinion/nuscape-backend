@@ -200,18 +200,22 @@ class UsageUploadWorker(
             val clamped = merged.mapNotNull { clampToWindows(it, screenTracker.windowsBetween(start, end)) }
 
             val items = clamped.map {
-                MobileItem(
-                    `package` = it.pkg,
-                    totalMs = (it.end - it.start),
-                    windowStart = Instant.ofEpochMilli(it.start).toString(),
-                    windowEnd   = Instant.ofEpochMilli(it.end).toString()
+                val startIso = Instant.ofEpochMilli(it.start).toString()
+                val endIso = Instant.ofEpochMilli(it.end).toString()
+                val totalMs = (it.end - it.start).coerceAtLeast(0L)
+                UsageItemDTO(
+                    pkg = it.pkg,
+                    windowStart = startIso,
+                    windowEnd = endIso,
+                    totalMs = totalMs,
+                    fg = true
                 )
             }.filter { it.totalMs >= 5_000 } // drop <5s blips
-
+       
             if (items.isNotEmpty()) {
                 val token = TokenStore.token(ctx) ?: return@withContext Result.retry()
                 val bearer = "Bearer $token"
-                val batch = UsageBatch(items)
+                val batch = UsageBatchDTO(items)
                 val resp = api.postUsageBatch(bearer, batch)
                 if (resp.isSuccessful) {
                     CursorStore.set(ctx, end) // advance only on success
