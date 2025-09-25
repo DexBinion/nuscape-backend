@@ -203,17 +203,13 @@ async def update_device_last_seen(db: AsyncSession, device_id) -> None:
     await db.commit()
 
 async def create_usage_logs(db: AsyncSession, device: Device, entries: List[UsageEntry]) -> UsageInsertResult:
-    """Insert or upsert usage logs. Returns accepted + duplicate counts."""
+    """Insert or upsert usage logs. Returns count of accepted rows and duplicates."""
 
-    accepted_count = 0
-    duplicate_count = 0
     device_id = device.id
     platform = (device.platform or "").strip().lower()
 
-    try:
-        dialect_name = db.sync_session.bind.dialect.name  # type: ignore[attr-defined]
-    except Exception:
-        dialect_name = ""
+    pending_rows: list[dict[str, object]] = []
+    pending_violations: list[PolicyViolation] = []
 
     for entry in entries:
         try:
@@ -231,79 +227,105 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
             app_id = resolution.app.app_id
 
             if app_id in policy_store.get_blocked_app_ids():
-                violation = PolicyViolation(
-                    device_id=device_id,
-                    app_id=app_id,
-                    violation_type="blocked_app",
-                    app_name=resolution.app.display_name,
-                    app_package=entry.app_name if namespace == "android" else None,
-                    domain=domain_value,
-                    violation_details=None,
-                    violation_timestamp=datetime.now(timezone.utc),
+                pending_violations.append(
+                    PolicyViolation(
+                        device_id=device_id,
+                        app_id=app_id,
+                        violation_type="blocked_app",
+                        app_name=resolution.app.display_name,
+                        app_package=entry.app_name if namespace == "android" else None,
+                        domain=domain_value,
+                        violation_details=None,
+                        violation_timestamp=datetime.now(timezone.utc),
+                    )
                 )
-                db.add(violation)
-                await db.commit()
                 continue
 
-            app_package_value = entry.app_name if namespace == "android" else None
-            app_label_value = entry.app_name if namespace not in {"web", "android"} else None
-
-            insert_values = {
-                "device_id": device_id,
-                "app_id": app_id,
-                "app_name": resolution.app.display_name,
-                "app_package": app_package_value,
-                "app_label": app_label_value,
-                "alias_namespace": namespace,
-                "alias_ident": alias_ident,
-                "domain": domain_value,
-                "start": entry.start,
-                "end": entry.end,
-                "duration": entry.duration,
-            }
-
-            usage_log_model = UsageLog(**insert_values)
-
-            if dialect_name == "sqlite":
-                db.add(usage_log_model)
-                await db.commit()
-                accepted_count += 1
-                continue
-
-            update_values = {
-                "app_id": insert_values["app_id"],
-                "app_name": insert_values["app_name"],
-                "app_package": insert_values["app_package"],
-                "app_label": insert_values["app_label"],
-                "alias_namespace": insert_values["alias_namespace"],
-                "alias_ident": insert_values["alias_ident"],
-                "domain": insert_values["domain"],
-                "end": insert_values["end"],
-                "duration": insert_values["duration"],
-            }
-
-            stmt = (
-                pg_insert(UsageLog)
-                .values(**insert_values)
-                .on_conflict_do_update(
-                    index_elements=["device_id", "app_package", "start", "end"],
-                    set_=update_values,
-                )
-                .returning(sa.literal_column("xmax = 0").label("inserted"))
+            pending_rows.append(
+                {
+                    "device_id": device_id,
+                    "app_id": app_id,
+                    "app_name": resolution.app.display_name,
+                    "app_package": entry.app_name if namespace == "android" else None,
+                    "app_label": entry.app_name if namespace not in {"web", "android"} else None,
+                    "alias_namespace": namespace,
+                    "alias_ident": alias_ident,
+                    "domain": domain_value,
+                    "start": entry.start,
+                    "end": entry.end,
+                    "duration": entry.duration,
+                }
             )
-
-            result = await db.execute(stmt)
-            row = result.fetchone()
-            await db.commit()
-
-            accepted_count += 1
-            if row and not row.inserted:
-                duplicate_count += 1
         except Exception:
             await db.rollback()
-            logger.exception("Failed to create usage log", extra={"device_id": str(device_id)})
+            logger.exception("Failed to prepare usage log", extra={"device_id": str(device_id)})
 
-    return UsageInsertResult(accepted=accepted_count, duplicates=duplicate_count)
+    if not pending_rows:
+        if pending_violations:
+            for violation in pending_violations:
+                db.add(violation)
+            await db.commit()
+        return UsageInsertResult(accepted=0, duplicates=0)
+
+    if pending_violations:
+        for violation in pending_violations:
+            db.add(violation)
+
+    dialect_name = getattr(getattr(db.bind, "dialect", None), "name", "")
+
+    duplicates = 0
+
+    if dialect_name == "postgresql":
+        stmt = pg_insert(UsageLog).values(pending_rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[UsageLog.device_id, UsageLog.app_package, UsageLog.start, UsageLog.end],
+            set_={
+                "app_id": stmt.excluded.app_id,
+                "app_name": stmt.excluded.app_name,
+                "app_package": stmt.excluded.app_package,
+                "app_label": stmt.excluded.app_label,
+                "alias_namespace": stmt.excluded.alias_namespace,
+                "alias_ident": stmt.excluded.alias_ident,
+                "domain": stmt.excluded.domain,
+                "end": stmt.excluded.end,
+                "duration": stmt.excluded.duration,
+            },
+        ).returning(sa.literal_column("xmax = 0").label("inserted"))
+
+        result = await db.execute(stmt)
+        rows = result.fetchall()
+        duplicates = sum(1 for row in rows if hasattr(row, "inserted") and not row.inserted)
+
+    elif dialect_name == "sqlite":
+        for row in pending_rows:
+            stmt = select(UsageLog).where(
+                UsageLog.device_id == row["device_id"],
+                UsageLog.app_package == row["app_package"],
+                UsageLog.start == row["start"],
+                UsageLog.end == row["end"],
+            )
+            existing = (await db.execute(stmt)).scalar_one_or_none()
+            if existing:
+                duplicates += 1
+                existing.app_id = row["app_id"]
+                existing.app_name = row["app_name"]
+                existing.app_package = row["app_package"]
+                existing.app_label = row["app_label"]
+                existing.alias_namespace = row["alias_namespace"]
+                existing.alias_ident = row["alias_ident"]
+                existing.domain = row["domain"]
+                existing.end = row["end"]
+                existing.duration = row["duration"]
+            else:
+                db.add(UsageLog(**row))
+
+    else:
+        raise RuntimeError(f"Unsupported database dialect: {dialect_name}")
+
+    await db.commit()
+
+    accepted = len(pending_rows)
+    return UsageInsertResult(accepted=accepted, duplicates=duplicates)
 async def aggregate_hourly_usage(db: AsyncSession, hour_start: datetime) -> int:
     """Aggregate usage events into hourly summaries for the specified hour"""
     from sqlalchemy import text
