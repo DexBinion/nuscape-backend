@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
@@ -30,6 +30,7 @@ from backend.routes_usage_debug import router as usage_debug_router
 from backend.metrics import metrics
 from backend.redis_client import redis_client
 from backend.app_seeds import load_app_seeds
+from pydantic import ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -37,6 +38,123 @@ from slowapi.errors import RateLimitExceeded
 # Environment variables - hardcode for debugging
 API_BASE_PATH = "/api/v1"  # Force correct API base path
 logging.error(f"🔍 DEBUG: API_BASE_PATH set to: '{API_BASE_PATH}'")
+
+CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+MAX_SESSION_DURATION = timedelta(hours=8)
+
+
+def _add_batch_error(errors: list[schemas.BatchItemError], index: int, message: str, code: str) -> None:
+    errors.append(schemas.BatchItemError(index=index, error=message, code=code))
+
+
+def _extract_raw_usage_items(body: dict) -> list:
+    raw_items = (
+        body.get("items")
+        or body.get("entries")
+        or body.get("sessions")
+        or []
+    )
+    if not isinstance(raw_items, list):
+        raise ValueError("Payload must include an array of items")
+    return raw_items
+
+
+def _collect_usage_entries(
+    raw_items: list, *, now: datetime
+) -> tuple[list[schemas.UsageEntry], list[schemas.BatchItemError]]:
+    """Normalize incoming usage payload items and capture validation errors."""
+
+    entries: list[schemas.UsageEntry] = []
+    errors: list[schemas.BatchItemError] = []
+
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            _add_batch_error(errors, idx, "Item must be a JSON object", "invalid_type")
+            continue
+
+        if "package" in item:
+            package = item.get("package")
+            total_ms = item.get("totalMs")
+            start_raw = item.get("windowStart")
+            end_raw = item.get("windowEnd")
+
+            if not package:
+                _add_batch_error(errors, idx, "Missing package", "missing_field")
+                continue
+            if total_ms is None:
+                _add_batch_error(errors, idx, "Missing totalMs", "missing_field")
+                continue
+            if not isinstance(total_ms, (int, float)):
+                _add_batch_error(errors, idx, "totalMs must be numeric", "invalid_duration")
+                continue
+            if total_ms <= 0:
+                _add_batch_error(errors, idx, "totalMs must be > 0", "non_positive_duration")
+                continue
+            if not start_raw or not end_raw:
+                _add_batch_error(errors, idx, "windowStart/windowEnd required", "missing_field")
+                continue
+            if not str(start_raw).endswith("Z") or not str(end_raw).endswith("Z"):
+                _add_batch_error(errors, idx, "Timestamps must be UTC with Z suffix", "timezone")
+                continue
+
+            try:
+                start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            except Exception as exc:
+                _add_batch_error(errors, idx, f"Invalid ISO timestamp: {exc}", "invalid_iso")
+                continue
+
+            if end_dt <= start_dt:
+                _add_batch_error(errors, idx, "windowEnd must be after windowStart", "end_not_after_start")
+                continue
+
+            if end_dt - start_dt > MAX_SESSION_DURATION:
+                _add_batch_error(errors, idx, "Session duration exceeds 8 hour limit", "window_too_long")
+                continue
+
+            if end_dt > now + CLOCK_SKEW_TOLERANCE:
+                _add_batch_error(errors, idx, "windowEnd is too far in the future", "clock_skew")
+                continue
+
+            duration_seconds = max(1, int((int(total_ms) + 999) // 1000))
+
+            entries.append(
+                schemas.UsageEntry(
+                    app_name=str(package),
+                    domain=None,
+                    start=start_dt,
+                    end=end_dt,
+                    duration=duration_seconds,
+                )
+            )
+            continue
+
+        if "app_name" in item:
+            try:
+                entry = schemas.UsageEntry(**item)
+            except ValidationError as exc:
+                _add_batch_error(errors, idx, f"Invalid entry payload: {exc}", "invalid_entry")
+                continue
+
+            if entry.end <= entry.start:
+                _add_batch_error(errors, idx, "end must be after start", "end_not_after_start")
+                continue
+            if entry.duration <= 0:
+                _add_batch_error(errors, idx, "duration must be > 0", "non_positive_duration")
+                continue
+            if entry.end - entry.start > MAX_SESSION_DURATION:
+                _add_batch_error(errors, idx, "Session duration exceeds 8 hour limit", "window_too_long")
+                continue
+            if entry.end > now + CLOCK_SKEW_TOLERANCE:
+                _add_batch_error(errors, idx, "end timestamp is too far in the future", "clock_skew")
+                continue
+
+            entries.append(entry)
+            continue
+
+        _add_batch_error(errors, idx, "Unsupported item format", "unsupported_item")
+
+    return entries, errors
 
 # Path setup for proper static file serving
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -544,92 +662,100 @@ async def create_usage_batch_tolerant(
             detail="Invalid or expired device token"
         )
     
-    # Handle both mobile (items) and server (entries) formats
-    raw_items = body_data.get('items') or body_data.get('entries') or body_data.get('sessions') or []
-    # Guardrail: validate mobile-format items require bounded windows (windowStart/windowEnd/totalMs)
-    validated_items = []
-    for i, item in enumerate(raw_items):
-        # Only validate mobile "package" shaped items; server-format entries are validated by Pydantic later
-        if isinstance(item, dict) and 'package' in item:
-            if not item.get('windowStart') or not item.get('windowEnd') or 'totalMs' not in item:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid item at index {i}: require windowStart, windowEnd and totalMs"
-                )
-            # Validate ISO timestamps and cap duration to 8 hours
-            try:
-                s = datetime.fromisoformat(item['windowStart'].replace('Z', '+00:00'))
-                e = datetime.fromisoformat(item['windowEnd'].replace('Z', '+00:00'))
-            except Exception:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid ISO timestamps in item at index {i}"
-                )
-            if (e - s).total_seconds() > 8 * 3600:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Item at index {i} exceeds maximum allowed session length"
-                )
-            validated_items.append(item)
-        else:
-            validated_items.append(item)
-    raw_items = validated_items
-    usage_entries = []
-    
-    for item in raw_items:
-        if 'package' in item:  # Mobile format
-            start_time = None
-            end_time = None
-            duration_seconds = None
-
-            if 'totalMs' in item and 'windowStart' in item and 'windowEnd' in item:
-                start_time = datetime.fromisoformat(item['windowStart'].replace('Z', '+00:00'))
-                end_time = datetime.fromisoformat(item['windowEnd'].replace('Z', '+00:00'))
-                duration_seconds = item['totalMs'] // 1000
-            elif 'started_at' in item and 'ended_at' in item:
-                start_time = datetime.fromisoformat(item['started_at'].replace('Z', '+00:00'))
-                end_time = datetime.fromisoformat(item['ended_at'].replace('Z', '+00:00'))
-                duration_seconds = max(0, int((end_time - start_time).total_seconds()))
-
-            if not start_time or not end_time or duration_seconds is None:
-                logging.warning(f"Unsupported mobile item payload: {item}")
-                continue
-
-            if end_time < start_time:
-                logging.warning(f"Discarding session with end < start: {item}")
-                continue
-
-            usage_entries.append(schemas.UsageEntry(
-                app_name=item['package'],
-                domain=None,
-                start=start_time,
-                end=end_time,
-                duration=duration_seconds
-            ))
-        elif 'app_name' in item:  # Server format
-            usage_entries.append(schemas.UsageEntry(**item))
-        else:
-            logging.warning(f"Unknown item format: {item}")
-    
     try:
-        # Create usage logs
-        accepted_count = await crud.create_usage_logs(db, device, usage_entries)
-        logging.warning(f"Accepted {accepted_count} usage entries for device {device.name}")
-        
-        # Update device last_seen_at
-        await crud.update_device_last_seen(db, device.id)
-        
-        return schemas.BatchResponse(accepted=accepted_count)
-    except sqlalchemy.exc.IntegrityError as ie:
-        # Duplicate session insert detected due to unique constraint - treat as idempotent success.
-        await db.rollback()
-        logging.warning("Duplicate session insert detected; ignoring duplicates: %s", ie)
-        return schemas.BatchResponse(accepted=0)
-    except Exception as e:
+        raw_items = _extract_raw_usage_items(body_data)
+    except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process usage batch: {str(e)}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    now = datetime.now(timezone.utc)
+    usage_entries, validation_errors = _collect_usage_entries(raw_items, now=now)
+
+    accepted_count = 0
+    duplicate_count = 0
+
+    if usage_entries:
+        try:
+            insert_result = await crud.create_usage_logs(db, device, usage_entries)
+            accepted_count = insert_result.accepted
+            duplicate_count = insert_result.duplicates
+            logging.warning(
+                "Accepted %s usage entries (duplicates=%s) for device %s",
+                accepted_count,
+                duplicate_count,
+                device.name,
+            )
+            if accepted_count:
+                await crud.update_device_last_seen(db, device.id)
+        except Exception as exc:
+            logging.exception("Failed to persist usage batch")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to process usage batch: {exc}",
+            )
+
+    rejected_count = len(validation_errors)
+    if rejected_count:
+        logging.warning(
+            "Rejected %s usage items for device %s", rejected_count, device.id
         )
+
+    return schemas.BatchResponse(
+        accepted=accepted_count,
+        duplicates=duplicate_count,
+        rejected=rejected_count,
+        errors=validation_errors,
+    )
+
+
+@app.post(f"{API_BASE_PATH}/usage/validate", response_model=schemas.BatchResponse)
+async def validate_usage_batch(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate a usage payload without persisting it."""
+
+    try:
+        body_data = await request.json()
+        logging.debug("== /api/v1/usage/validate ==")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {exc}",
+        )
+
+    device = await auth.verify_device_jwt_auth(db, credentials.credentials)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired device token",
+        )
+
+    try:
+        raw_items = _extract_raw_usage_items(body_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    entries, errors = _collect_usage_entries(raw_items, now=datetime.now(timezone.utc))
+    rejected_count = len(errors)
+
+    if rejected_count:
+        logging.debug(
+            "Validation rejected %s items for device %s", rejected_count, device.id
+        )
+
+    return schemas.BatchResponse(
+        accepted=len(entries),
+        duplicates=0,
+        rejected=rejected_count,
+        errors=errors,
+    )
 
 # Old desktop endpoint removed - now handled by routes_usage_desktop.py
 

@@ -1,10 +1,13 @@
 import secrets
 import re
 import unicodedata
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 import sqlalchemy as sa
 from sqlalchemy import select, func, and_, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from backend import policy_store
@@ -12,6 +15,8 @@ from backend.models import Device, UsageLog, UsageEvent, HourlyAggregate, Policy
 from backend.app_directory import resolve_app, infer_alias_context
 from backend.schemas import DeviceCreate, UsageEntry, DeviceInfo, StatsResponse, AppStats, UsageSeries, UsagePoint, TopAppItem
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 def _merge_usage_points(points: List[UsagePoint]) -> List[UsagePoint]:
     """Merge usage points by timestamp, summing minutes and breakdowns"""
@@ -43,6 +48,12 @@ def _merge_usage_points(points: List[UsagePoint]) -> List[UsagePoint]:
     return result
 
 # Helper utilities for canonical app resolution
+
+
+@dataclass
+class UsageInsertResult:
+    accepted: int
+    duplicates: int
 
 def _slugify_legacy(value: str) -> str:
     value = unicodedata.normalize("NFKD", value or "legacy")
@@ -191,11 +202,18 @@ async def update_device_last_seen(db: AsyncSession, device_id) -> None:
     )
     await db.commit()
 
-async def create_usage_logs(db: AsyncSession, device: Device, entries: List[UsageEntry]) -> int:
-    """Create multiple usage logs and return count of accepted entries."""
+async def create_usage_logs(db: AsyncSession, device: Device, entries: List[UsageEntry]) -> UsageInsertResult:
+    """Insert or upsert usage logs. Returns accepted + duplicate counts."""
+
     accepted_count = 0
+    duplicate_count = 0
     device_id = device.id
     platform = (device.platform or "").strip().lower()
+
+    try:
+        dialect_name = db.sync_session.bind.dialect.name  # type: ignore[attr-defined]
+    except Exception:
+        dialect_name = ""
 
     for entry in entries:
         try:
@@ -216,9 +234,9 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
                 violation = PolicyViolation(
                     device_id=device_id,
                     app_id=app_id,
-                    violation_type='blocked_app',
+                    violation_type="blocked_app",
                     app_name=resolution.app.display_name,
-                    app_package=entry.app_name if namespace == 'android' else None,
+                    app_package=entry.app_name if namespace == "android" else None,
                     domain=domain_value,
                     violation_details=None,
                     violation_timestamp=datetime.now(timezone.utc),
@@ -227,28 +245,65 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
                 await db.commit()
                 continue
 
-            usage_log = UsageLog(
-                device_id=device_id,
-                app_id=app_id,
-                app_name=resolution.app.display_name,
-                app_package=entry.app_name if namespace == 'android' else None,
-                app_label=entry.app_name if namespace not in {'web', 'android'} else None,
-                alias_namespace=namespace,
-                alias_ident=alias_ident,
-                domain=domain_value,
-                start=entry.start,
-                end=entry.end,
-                duration=entry.duration,
+            app_package_value = entry.app_name if namespace == "android" else None
+            app_label_value = entry.app_name if namespace not in {"web", "android"} else None
+
+            insert_values = {
+                "device_id": device_id,
+                "app_id": app_id,
+                "app_name": resolution.app.display_name,
+                "app_package": app_package_value,
+                "app_label": app_label_value,
+                "alias_namespace": namespace,
+                "alias_ident": alias_ident,
+                "domain": domain_value,
+                "start": entry.start,
+                "end": entry.end,
+                "duration": entry.duration,
+            }
+
+            usage_log_model = UsageLog(**insert_values)
+
+            if dialect_name == "sqlite":
+                db.add(usage_log_model)
+                await db.commit()
+                accepted_count += 1
+                continue
+
+            update_values = {
+                "app_id": insert_values["app_id"],
+                "app_name": insert_values["app_name"],
+                "app_package": insert_values["app_package"],
+                "app_label": insert_values["app_label"],
+                "alias_namespace": insert_values["alias_namespace"],
+                "alias_ident": insert_values["alias_ident"],
+                "domain": insert_values["domain"],
+                "end": insert_values["end"],
+                "duration": insert_values["duration"],
+            }
+
+            stmt = (
+                pg_insert(UsageLog)
+                .values(**insert_values)
+                .on_conflict_do_update(
+                    index_elements=["device_id", "app_package", "start", "end"],
+                    set_=update_values,
+                )
+                .returning(sa.literal_column("xmax = 0").label("inserted"))
             )
 
-            db.add(usage_log)
+            result = await db.execute(stmt)
+            row = result.fetchone()
             await db.commit()
-            accepted_count += 1
-        except Exception as exc:
-            await db.rollback()
-            print(f"Failed to create usage log: {exc}")
 
-    return accepted_count
+            accepted_count += 1
+            if row and not row.inserted:
+                duplicate_count += 1
+        except Exception:
+            await db.rollback()
+            logger.exception("Failed to create usage log", extra={"device_id": str(device_id)})
+
+    return UsageInsertResult(accepted=accepted_count, duplicates=duplicate_count)
 async def aggregate_hourly_usage(db: AsyncSession, hour_start: datetime) -> int:
     """Aggregate usage events into hourly summaries for the specified hour"""
     from sqlalchemy import text

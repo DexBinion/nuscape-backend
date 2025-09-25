@@ -123,8 +123,8 @@ async def test_blocked_app_produces_violation(session):
         duration=300,
     )
 
-    accepted = await crud.create_usage_logs(session, device, [entry])
-    assert accepted == 0
+    result = await crud.create_usage_logs(session, device, [entry])
+    assert result.accepted == 0
 
     violations = (await session.execute(select(models.PolicyViolation))).scalars().all()
     assert len(violations) == 1

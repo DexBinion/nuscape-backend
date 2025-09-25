@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY, HTTP_403_FORBIDDEN
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
-from backend.schemas import DesktopUsageBatch, UsageEntry
+from backend.schemas import DesktopUsageBatch, UsageEntry, BatchResponse
 from backend.auth import require_device
 from backend import crud
 import logging
@@ -40,16 +40,20 @@ async def usage_batch_desktop(
         )
 
     accepted = 0
+    duplicates = 0
     if entries:
-        accepted = await crud.create_usage_logs(db, device, entries)
+        result = await crud.create_usage_logs(db, device, entries)
+        accepted = result.accepted
+        duplicates = result.duplicates
         total_duration_mins = sum(e.duration for e in entries) // 60
         log.info(
-            "desktop accepted=%d device=%s total_mins=%d",
+            "desktop accepted=%d duplicates=%d device=%s total_mins=%d",
             accepted,
+            duplicates,
             device.id,
             total_duration_mins,
         )
 
-    return {"accepted": accepted}
+    return BatchResponse(accepted=accepted, duplicates=duplicates)
 
 

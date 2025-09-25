@@ -63,8 +63,17 @@ class UsageBatch(BaseModel):
 class MobileUsageBatch(BaseModel):
     items: List[MobileUsageItem]
 
+class BatchItemError(BaseModel):
+    index: int
+    error: str
+    code: Optional[str] = None
+
+
 class BatchResponse(BaseModel):
     accepted: int
+    duplicates: int = 0
+    rejected: int = 0
+    errors: List[BatchItemError] = Field(default_factory=list)
 
 # Desktop usage entry schemas (per attached fix)
 class DesktopUsageEntry(BaseModel):
@@ -242,7 +251,7 @@ class ViolationResponse(BaseModel):
 
 
 # Apply config to all schemas - use model_config for Pydantic v2
-for model_class in [DeviceCreate, DeviceInfo, UsageEntry, UsageBatch, BatchResponse, AppStats, StatsResponse,
+for model_class in [DeviceCreate, DeviceInfo, UsageEntry, UsageBatch, BatchItemError, BatchResponse, AppStats, StatsResponse,
                    HeartbeatRequest, HeartbeatResponse, UsageEventCreate, EventsBatchRequest, EventsBatchResponse,
                    DevicePolicy, PolicyViolationCreate, ViolationResponse]:
     if not hasattr(model_class, 'model_config'):
