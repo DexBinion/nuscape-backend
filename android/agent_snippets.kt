@@ -28,6 +28,7 @@ import java.time.Instant
 import java.util.Collections
 import kotlin.math.max
 import kotlin.math.min
+import com.google.gson.annotations.SerializedName
 
 // ---------------------------
 // CursorStore - persist last cursor timestamp
@@ -132,14 +133,17 @@ val NOISE = setOf(
 // ---------------------------
 // Mobile payload types for server (matches backend expected mobile format)
 // ---------------------------
-data class MobileItem(
-    val `package`: String,
-    val totalMs: Long,
-    val windowStart: String,
-    val windowEnd: String
+data class UsageItemDTO(
+    @SerializedName("package") val pkg: String,
+    @SerializedName("windowStart") val windowStart: String,
+    @SerializedName("windowEnd") val windowEnd: String,
+    @SerializedName("totalMs") val totalMs: Long,
+    @SerializedName("fg") val fg: Boolean? = null
 )
 
-data class UsageBatch(val items: List<MobileItem>)
+data class UsageBatchDTO(
+    @SerializedName("items") val items: List<UsageItemDTO>
+)
 
 // ---------------------------
 // Retrofit interface (assumes Moshi/Gson converter already configured)
@@ -149,7 +153,7 @@ interface BackendApi {
     @POST("/api/v1/usage/batch")
     suspend fun postUsageBatch(
         @Header("Authorization") bearer: String,
-        @Body batch: UsageBatch
+        @Body batch: UsageBatchDTO
     ): Response<Any>
 }
 
