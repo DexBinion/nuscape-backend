@@ -41,5 +41,6 @@ channel = "stable-25_05"
 packages = ["postgresql"]
 
 [deployment]
-deploymentTarget = "vm"
-run = ["uvicorn", "backend.main:app", "--host", "0.0.0.0"]
+deploymentTarget = "autoscale"
+run = ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "5000"]
+build = ["pip", "install", "-e", "."]
