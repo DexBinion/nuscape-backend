@@ -679,27 +679,24 @@ async def create_usage_batch_tolerant(
 
     if usage_entries:
         try:
-            async with db.begin():
-                insert_result = await crud.create_usage_logs(
+            insert_result = await crud.create_usage_logs(
+                db,
+                device,
+                usage_entries,
+            )
+            accepted_count = insert_result.accepted
+            duplicate_count = insert_result.duplicates
+            logging.warning(
+                "Accepted %s usage entries (duplicates=%s) for device %s",
+                accepted_count,
+                duplicate_count,
+                device.name,
+            )
+            if accepted_count:
+                await crud.update_device_last_seen(
                     db,
-                    device,
-                    usage_entries,
-                    auto_commit=False,
+                    device.id,
                 )
-                accepted_count = insert_result.accepted
-                duplicate_count = insert_result.duplicates
-                logging.warning(
-                    "Accepted %s usage entries (duplicates=%s) for device %s",
-                    accepted_count,
-                    duplicate_count,
-                    device.name,
-                )
-                if accepted_count:
-                    await crud.update_device_last_seen(
-                        db,
-                        device.id,
-                        auto_commit=False,
-                    )
         except Exception as exc:
             logging.exception("Failed to persist usage batch")
             raise HTTPException(
