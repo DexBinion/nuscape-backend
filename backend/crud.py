@@ -15,6 +15,7 @@ from backend.models import Device, UsageLog, UsageEvent, HourlyAggregate, Policy
 from backend.app_directory import resolve_app, infer_alias_context
 from backend.schemas import DeviceCreate, UsageEntry, DeviceInfo, StatsResponse, AppStats, UsageSeries, UsagePoint, TopAppItem
 from collections import defaultdict
+from typing import Iterable, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,40 @@ async def update_device_last_seen(db: AsyncSession, device_id, *, auto_commit: b
     if auto_commit:
         await db.commit()
 
+async def upsert_usage_rows(
+    db: AsyncSession,
+    rows: Iterable[dict],
+) -> Tuple[int, int]:
+    """Insert usage rows with ON CONFLICT DO NOTHING.
+
+    Returns a tuple of (inserted_count, skipped_count).
+    """
+
+    rows = list(rows)
+    if not rows:
+        return 0, 0
+
+    stmt = (
+        pg_insert(UsageLog)
+        .values(rows)
+        .on_conflict_do_nothing(
+            index_elements=[
+                UsageLog.device_id,
+                UsageLog.app_package,
+                UsageLog.start,
+                UsageLog.end,
+            ]
+        )
+        .returning(UsageLog.id)
+    )
+
+    result = await db.execute(stmt)
+    inserted_ids = result.scalars().all()
+    inserted = len(inserted_ids)
+    skipped = len(rows) - inserted
+    return inserted, skipped
+
+
 async def create_usage_logs(
     db: AsyncSession,
     device: Device,
@@ -282,27 +317,11 @@ async def create_usage_logs(
     dialect_name = getattr(getattr(db.bind, "dialect", None), "name", "")
 
     duplicates = 0
+    accepted = 0
 
     if dialect_name == "postgresql":
-        stmt = pg_insert(UsageLog).values(pending_rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[UsageLog.device_id, UsageLog.app_package, UsageLog.start, UsageLog.end],
-            set_={
-                "app_id": stmt.excluded.app_id,
-                "app_name": stmt.excluded.app_name,
-                "app_package": stmt.excluded.app_package,
-                "app_label": stmt.excluded.app_label,
-                "alias_namespace": stmt.excluded.alias_namespace,
-                "alias_ident": stmt.excluded.alias_ident,
-                "domain": stmt.excluded.domain,
-                "end": stmt.excluded.end,
-                "duration": stmt.excluded.duration,
-            },
-        ).returning(sa.literal_column("xmax = 0").label("inserted"))
-
-        result = await db.execute(stmt)
-        rows = result.fetchall()
-        duplicates = sum(1 for row in rows if hasattr(row, "inserted") and not row.inserted)
+        inserted, duplicates = await upsert_usage_rows(db, pending_rows)
+        accepted = inserted
 
     elif dialect_name == "sqlite":
         for row in pending_rows:
@@ -327,13 +346,17 @@ async def create_usage_logs(
             else:
                 db.add(UsageLog(**row))
 
+        accepted = len(pending_rows) - duplicates
+
     else:
         raise RuntimeError(f"Unsupported database dialect: {dialect_name}")
 
     if auto_commit:
         await db.commit()
 
-    accepted = len(pending_rows)
+    if not accepted:
+        accepted = len(pending_rows) - duplicates
+
     return UsageInsertResult(accepted=accepted, duplicates=duplicates)
 async def aggregate_hourly_usage(db: AsyncSession, hour_start: datetime) -> int:
     """Aggregate usage events into hourly summaries for the specified hour"""
