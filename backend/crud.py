@@ -257,8 +257,8 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
                 }
             )
         except Exception:
-            await db.rollback()
             logger.exception("Failed to prepare usage log", extra={"device_id": str(device_id)})
+            # Let the calling function handle rollback to avoid session context issues
 
     if not pending_rows:
         if pending_violations:
