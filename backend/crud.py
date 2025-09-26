@@ -191,18 +191,25 @@ async def get_device_by_name(db: AsyncSession, name: str) -> Optional[Device]:
     )
     return result.scalar_one_or_none()
 
-async def update_device_last_seen(db: AsyncSession, device_id) -> None:
+async def update_device_last_seen(db: AsyncSession, device_id, *, auto_commit: bool = True) -> None:
     """Update device last_seen_at timestamp"""
     from sqlalchemy import update
-    
+
     await db.execute(
         update(Device)
         .where(Device.id == device_id)
         .values(last_seen_at=datetime.now(timezone.utc))
     )
-    await db.commit()
+    if auto_commit:
+        await db.commit()
 
-async def create_usage_logs(db: AsyncSession, device: Device, entries: List[UsageEntry]) -> UsageInsertResult:
+async def create_usage_logs(
+    db: AsyncSession,
+    device: Device,
+    entries: List[UsageEntry],
+    *,
+    auto_commit: bool = True,
+) -> UsageInsertResult:
     """Insert or upsert usage logs. Returns count of accepted rows and duplicates."""
 
     device_id = device.id
@@ -258,13 +265,14 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
             )
         except Exception:
             logger.exception("Failed to prepare usage log", extra={"device_id": str(device_id)})
-            # Let the calling function handle rollback to avoid session context issues
+            raise
 
     if not pending_rows:
         if pending_violations:
             for violation in pending_violations:
                 db.add(violation)
-            await db.commit()
+            if auto_commit:
+                await db.commit()
         return UsageInsertResult(accepted=0, duplicates=0)
 
     if pending_violations:
@@ -322,7 +330,8 @@ async def create_usage_logs(db: AsyncSession, device: Device, entries: List[Usag
     else:
         raise RuntimeError(f"Unsupported database dialect: {dialect_name}")
 
-    await db.commit()
+    if auto_commit:
+        await db.commit()
 
     accepted = len(pending_rows)
     return UsageInsertResult(accepted=accepted, duplicates=duplicates)
