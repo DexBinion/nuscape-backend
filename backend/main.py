@@ -319,10 +319,11 @@ async def startup():
     # Initialize DB engine in a reload-safe way (defers engine creation to backend.database.init_engine)
     import backend.database as database
     database.init_engine()
-    async with database.engine.begin() as conn:
-        await conn.run_sync(models.Base.metadata.create_all)
-    async with database.AsyncSessionLocal() as session:
-        await load_app_seeds(session)
+    if database.engine:
+        async with database.engine.begin() as conn:
+            await conn.run_sync(models.Base.metadata.create_all)
+        async with database.AsyncSessionLocal() as session:
+            await load_app_seeds(session)
 
 # Token refresh endpoint
 @app.post(
