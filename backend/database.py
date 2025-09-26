@@ -65,13 +65,14 @@ def init_engine(database_url: Optional[str] = None):
         "pool_timeout": 30,
     }
 
+    # Explicitly assign to globals to avoid creating local variables
     if _connect_args:
         engine = create_async_engine(CLEAN_DATABASE_URL, connect_args=_connect_args, **_connect_kwargs)
     else:
         engine = create_async_engine(CLEAN_DATABASE_URL, **_connect_kwargs)
 
     AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    logger.info("Database engine initialized")
+    logger.info(f"Database engine initialized: {type(engine)} with driver {getattr(engine.dialect, 'driver', None)}")
 
 async def get_db():
     """
