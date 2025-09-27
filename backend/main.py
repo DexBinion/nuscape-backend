@@ -677,10 +677,8 @@ async def create_usage_batch_tolerant(
     accepted_count = 0
     duplicate_count = 0
 
-    existing_tx = db.get_transaction()
-    if existing_tx is not None or db.in_transaction():
-        # Close any existing transaction (e.g. from auth verification) before starting our own
-        await db.rollback()
+    # Close any lingering transaction (read-only query) before starting ours
+    await db.rollback()
 
     try:
         async with db.begin():
