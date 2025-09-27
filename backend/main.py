@@ -662,7 +662,7 @@ async def create_usage_batch_tolerant(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired device token"
         )
-    
+
     try:
         raw_items = _extract_raw_usage_items(body_data)
     except ValueError as exc:
@@ -677,33 +677,39 @@ async def create_usage_batch_tolerant(
     accepted_count = 0
     duplicate_count = 0
 
-    if usage_entries:
-        try:
-            async with db.begin():
-                insert_result = await crud.create_usage_logs(
-                    db,
-                    device,
-                    usage_entries,
-                )
-                accepted_count = insert_result.accepted
-                duplicate_count = insert_result.duplicates
-                logging.warning(
-                    "Accepted %s usage entries (duplicates=%s) for device %s",
-                    accepted_count,
-                    duplicate_count,
-                    device.name,
-                )
-                if accepted_count:
-                    await crud.update_device_last_seen(
-                        db,
-                        device.id,
-                    )
-        except Exception as exc:
-            logging.exception("Failed to persist usage batch")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to process usage batch: {exc}",
+    try:
+        if usage_entries:
+            insert_result = await crud.create_usage_logs(
+                db,
+                device,
+                usage_entries,
             )
+            accepted_count = insert_result.accepted
+            duplicate_count = insert_result.duplicates
+            logging.warning(
+                "Accepted %s usage entries (duplicates=%s) for device %s",
+                accepted_count,
+                duplicate_count,
+                getattr(device, "name", "<unknown>"),
+            )
+            if accepted_count:
+                await crud.update_device_last_seen(
+                    db,
+                    device.id,
+                )
+        await db.commit()
+    except HTTPException:
+        if db.in_transaction():
+            await db.rollback()
+        raise
+    except Exception as exc:
+        if db.in_transaction():
+            await db.rollback()
+        logging.exception("Failed to persist usage batch")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process usage batch: {exc}",
+        )
 
     rejected_count = len(validation_errors)
     if rejected_count:
