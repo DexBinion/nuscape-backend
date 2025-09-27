@@ -42,12 +42,20 @@ async def usage_batch_desktop(
     accepted = 0
     duplicates = 0
     if entries:
-        async with db.begin():
-            result = await crud.create_usage_logs(db, device, entries)
-            accepted = result.accepted
-            duplicates = result.duplicates
-            if accepted:
-                await crud.update_device_last_seen(db, device.id)
+        if db.in_transaction():
+            await db.commit()
+
+        try:
+            async with db.begin():
+                result = await crud.create_usage_logs(db, device, entries)
+                accepted = result.accepted
+                duplicates = result.duplicates
+                if accepted:
+                    await crud.update_device_last_seen(db, device.id)
+        except Exception as exc:
+            log.exception("desktop usage batch failed")
+            raise HTTPException(status_code=500, detail=f"Failed to persist usage: {exc}")
+
         total_duration_mins = sum(e.duration for e in entries) // 60
         log.info(
             "desktop accepted=%d duplicates=%d device=%s total_mins=%d",
@@ -58,5 +66,3 @@ async def usage_batch_desktop(
         )
 
     return BatchResponse(accepted=accepted, duplicates=duplicates)
-
-

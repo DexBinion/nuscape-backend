@@ -677,34 +677,34 @@ async def create_usage_batch_tolerant(
     accepted_count = 0
     duplicate_count = 0
 
-    try:
-        if usage_entries:
-            insert_result = await crud.create_usage_logs(
-                db,
-                device,
-                usage_entries,
-            )
-            accepted_count = insert_result.accepted
-            duplicate_count = insert_result.duplicates
-            logging.warning(
-                "Accepted %s usage entries (duplicates=%s) for device %s",
-                accepted_count,
-                duplicate_count,
-                getattr(device, "name", "<unknown>"),
-            )
-            if accepted_count:
-                await crud.update_device_last_seen(
-                    db,
-                    device.id,
-                )
+    if db.in_transaction():
+        # Close any existing transaction (e.g. from auth verification) before starting our own
         await db.commit()
+
+    try:
+        async with db.begin():
+            if usage_entries:
+                insert_result = await crud.create_usage_logs(
+                    db,
+                    device,
+                    usage_entries,
+                )
+                accepted_count = insert_result.accepted
+                duplicate_count = insert_result.duplicates
+                logging.warning(
+                    "Accepted %s usage entries (duplicates=%s) for device %s",
+                    accepted_count,
+                    duplicate_count,
+                    getattr(device, "name", "<unknown>"),
+                )
+                if accepted_count:
+                    await crud.update_device_last_seen(
+                        db,
+                        device.id,
+                    )
     except HTTPException:
-        if db.in_transaction():
-            await db.rollback()
         raise
     except Exception as exc:
-        if db.in_transaction():
-            await db.rollback()
         logging.exception("Failed to persist usage batch")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
