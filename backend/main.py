@@ -41,6 +41,7 @@ logging.error(f"🔍 DEBUG: API_BASE_PATH set to: '{API_BASE_PATH}'")
 
 CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 MAX_SESSION_DURATION = timedelta(hours=8)
+MIN_FOREGROUND_DURATION_MS = 5000
 
 
 def _add_batch_error(errors: list[schemas.BatchItemError], index: int, message: str, code: str) -> None:
@@ -90,6 +91,16 @@ def _collect_usage_entries(
             if total_ms <= 0:
                 _add_batch_error(errors, idx, "totalMs must be > 0", "non_positive_duration")
                 continue
+
+            fg_flag = bool(item.get("fg", True))
+            screen_on_flag = bool(item.get("screen_on", True))
+            if not fg_flag or not screen_on_flag:
+                _add_batch_error(errors, idx, "Session ignored: app not in foreground with screen on", "background_event")
+                continue
+            if total_ms < MIN_FOREGROUND_DURATION_MS:
+                _add_batch_error(errors, idx, f"Session ignored: duration {total_ms}ms below threshold", "duration_below_threshold")
+                continue
+
             if not start_raw or not end_raw:
                 _add_batch_error(errors, idx, "windowStart/windowEnd required", "missing_field")
                 continue
