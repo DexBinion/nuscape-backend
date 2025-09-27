@@ -678,7 +678,7 @@ async def create_usage_batch_tolerant(
     duplicate_count = 0
 
     if db.in_transaction():
-        await db.rollback()
+        await db.commit()
 
     try:
         async with db.begin():
