@@ -702,6 +702,8 @@ async def create_usage_batch_tolerant(
                         db,
                         device.id,
                     )
+            else:
+                logging.warning("Usage batch contained zero entries after validation")
     except HTTPException:
         raise
     except Exception as exc:
@@ -716,6 +718,14 @@ async def create_usage_batch_tolerant(
         logging.warning(
             "Rejected %s usage items for device %s", rejected_count, device.id
         )
+
+    logging.warning(
+        "Usage batch processed: accepted=%s duplicates=%s rejected=%s for device %s",
+        accepted_count,
+        duplicate_count,
+        rejected_count,
+        device.id,
+    )
 
     return schemas.BatchResponse(
         accepted=accepted_count,
