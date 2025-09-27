@@ -42,8 +42,9 @@ async def usage_batch_desktop(
     accepted = 0
     duplicates = 0
     if entries:
-        if db.in_transaction():
-            await db.commit()
+        existing_tx = db.get_transaction()
+        if existing_tx is not None or db.in_transaction():
+            await db.rollback()
 
         try:
             async with db.begin():
