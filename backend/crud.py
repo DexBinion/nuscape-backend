@@ -192,7 +192,7 @@ async def get_device_by_name(db: AsyncSession, name: str) -> Optional[Device]:
     )
     return result.scalar_one_or_none()
 
-async def update_device_last_seen(db: AsyncSession, device_id, *, auto_commit: bool = True) -> None:
+async def update_device_last_seen(db: AsyncSession, device_id) -> None:
     """Update device last_seen_at timestamp"""
     from sqlalchemy import update
 
@@ -201,8 +201,6 @@ async def update_device_last_seen(db: AsyncSession, device_id, *, auto_commit: b
         .where(Device.id == device_id)
         .values(last_seen_at=datetime.now(timezone.utc))
     )
-    if auto_commit:
-        await db.commit()
 
 async def upsert_usage_rows(
     db: AsyncSession,
@@ -242,8 +240,6 @@ async def create_usage_logs(
     db: AsyncSession,
     device: Device,
     entries: List[UsageEntry],
-    *,
-    auto_commit: bool = True,
 ) -> UsageInsertResult:
     """Insert or upsert usage logs. Returns count of accepted rows and duplicates."""
 
@@ -306,8 +302,6 @@ async def create_usage_logs(
         if pending_violations:
             for violation in pending_violations:
                 db.add(violation)
-            if auto_commit:
-                await db.commit()
         return UsageInsertResult(accepted=0, duplicates=0)
 
     if pending_violations:
@@ -351,13 +345,11 @@ async def create_usage_logs(
     else:
         raise RuntimeError(f"Unsupported database dialect: {dialect_name}")
 
-    if auto_commit:
-        await db.commit()
-
     if not accepted:
         accepted = len(pending_rows) - duplicates
 
     return UsageInsertResult(accepted=accepted, duplicates=duplicates)
+
 async def aggregate_hourly_usage(db: AsyncSession, hour_start: datetime) -> int:
     """Aggregate usage events into hourly summaries for the specified hour"""
     from sqlalchemy import text

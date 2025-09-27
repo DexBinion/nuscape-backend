@@ -679,24 +679,25 @@ async def create_usage_batch_tolerant(
 
     if usage_entries:
         try:
-            insert_result = await crud.create_usage_logs(
-                db,
-                device,
-                usage_entries,
-            )
-            accepted_count = insert_result.accepted
-            duplicate_count = insert_result.duplicates
-            logging.warning(
-                "Accepted %s usage entries (duplicates=%s) for device %s",
-                accepted_count,
-                duplicate_count,
-                device.name,
-            )
-            if accepted_count:
-                await crud.update_device_last_seen(
+            async with db.begin():
+                insert_result = await crud.create_usage_logs(
                     db,
-                    device.id,
+                    device,
+                    usage_entries,
                 )
+                accepted_count = insert_result.accepted
+                duplicate_count = insert_result.duplicates
+                logging.warning(
+                    "Accepted %s usage entries (duplicates=%s) for device %s",
+                    accepted_count,
+                    duplicate_count,
+                    device.name,
+                )
+                if accepted_count:
+                    await crud.update_device_last_seen(
+                        db,
+                        device.id,
+                    )
         except Exception as exc:
             logging.exception("Failed to persist usage batch")
             raise HTTPException(
@@ -840,7 +841,8 @@ async def create_event(
         logging.warning("Event:\n%s", json.dumps(event_data, indent=2, ensure_ascii=False))
         
         # Update device last_seen_at
-        await crud.update_device_last_seen(db, device.id)
+        async with db.begin():
+            await crud.update_device_last_seen(db, device.id)
         
         return {"status": "ok", "received": True}
     except Exception as e:
@@ -1201,7 +1203,8 @@ async def create_device_events(
             errors.append(f"Event rejected: {str(e)}")
 
     # Update device last_seen_at
-    await crud.update_device_last_seen(db, device.id)
+    async with db.begin():
+        await crud.update_device_last_seen(db, device.id)
 
     return schemas.EventsBatchResponse(
         accepted=accepted,

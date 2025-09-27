@@ -1,0 +1,751 @@
+Usage Tracking & Reporting Reference
+=====================================
+
+This file gathers the core server-side code involved in ingestion, validation,
+persistence, and modeling of usage telemetry so it can be shared as a single artifact.
+
+## backend/main.py
+Core usage ingestion funnels and helpers.
+````python
+def _extract_raw_usage_items(body: dict) -> list:
+    raw_items = (
+        body.get("items")
+        or body.get("entries")
+        or body.get("sessions")
+        or []
+    )
+    if not isinstance(raw_items, list):
+        raise ValueError("Payload must include an array of items")
+    return raw_items
+
+def _collect_usage_entries(
+    raw_items: list, *, now: datetime
+) -> tuple[list[schemas.UsageEntry], list[schemas.BatchItemError]]:
+    """Normalize incoming usage payload items and capture validation errors."""
+
+    entries: list[schemas.UsageEntry] = []
+    errors: list[schemas.BatchItemError] = []
+
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            _add_batch_error(errors, idx, "Item must be a JSON object", "invalid_type")
+            continue
+
+        if "package" in item:
+            package = item.get("package")
+            total_ms = item.get("totalMs")
+            start_raw = item.get("windowStart")
+            end_raw = item.get("windowEnd")
+
+            if not package:
+                _add_batch_error(errors, idx, "Missing package", "missing_field")
+                continue
+            if total_ms is None:
+                _add_batch_error(errors, idx, "Missing totalMs", "missing_field")
+                continue
+            if not isinstance(total_ms, (int, float)):
+                _add_batch_error(errors, idx, "totalMs must be numeric", "invalid_duration")
+                continue
+            if total_ms <= 0:
+                _add_batch_error(errors, idx, "totalMs must be > 0", "non_positive_duration")
+                continue
+            if not start_raw or not end_raw:
+                _add_batch_error(errors, idx, "windowStart/windowEnd required", "missing_field")
+                continue
+            if not str(start_raw).endswith("Z") or not str(end_raw).endswith("Z"):
+                _add_batch_error(errors, idx, "Timestamps must be UTC with Z suffix", "timezone")
+                continue
+
+            try:
+                start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            except Exception as exc:
+                _add_batch_error(errors, idx, f"Invalid ISO timestamp: {exc}", "invalid_iso")
+                continue
+
+            if end_dt <= start_dt:
+                _add_batch_error(errors, idx, "windowEnd must be after windowStart", "end_not_after_start")
+                continue
+
+            if end_dt - start_dt > MAX_SESSION_DURATION:
+                _add_batch_error(errors, idx, "Session duration exceeds 8 hour limit", "window_too_long")
+                continue
+
+            if end_dt > now + CLOCK_SKEW_TOLERANCE:
+                _add_batch_error(errors, idx, "windowEnd is too far in the future", "clock_skew")
+                continue
+
+            duration_seconds = max(1, int((int(total_ms) + 999) // 1000))
+
+            entries.append(
+                schemas.UsageEntry(
+                    app_name=str(package),
+                    domain=None,
+                    start=start_dt,
+                    end=end_dt,
+                    duration=duration_seconds,
+                )
+            )
+            continue
+
+        if "app_name" in item:
+            try:
+                entry = schemas.UsageEntry(**item)
+            except ValidationError as exc:
+                _add_batch_error(errors, idx, f"Invalid entry payload: {exc}", "invalid_entry")
+                continue
+
+            if entry.end <= entry.start:
+                _add_batch_error(errors, idx, "end must be after start", "end_not_after_start")
+                continue
+            if entry.duration <= 0:
+                _add_batch_error(errors, idx, "duration must be > 0", "non_positive_duration")
+                continue
+            if entry.end - entry.start > MAX_SESSION_DURATION:
+                _add_batch_error(errors, idx, "Session duration exceeds 8 hour limit", "window_too_long")
+                continue
+            if entry.end > now + CLOCK_SKEW_TOLERANCE:
+                _add_batch_error(errors, idx, "end timestamp is too far in the future", "clock_skew")
+                continue
+
+            entries.append(entry)
+            continue
+
+        _add_batch_error(errors, idx, "Unsupported item format", "unsupported_item")
+
+    return entries, errors
+
+# Path setup for proper static file serving
+BASE_DIR = Path(__file__).resolve().parent.parent
+DIST_DIR = BASE_DIR / "dist"
+
+# Rate limiting setup
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(
+    title="NuScape Usage Tracker", 
+    version="1.1.0",
+    description="Cross-platform usage tracking with JWT-based device authentication",
+    openapi_tags=[
+        {"name": "auth", "description": "JWT device authentication (register, refresh, revoke)"},
+        {"name": "usage", "description": "Usage data collection and analytics"},
+        {"name": "devices", "description": "Device management and heartbeats"},
+        {"name": "stats", "description": "Usage statistics and analytics"},
+    ]
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # Type issue is a slowapi library quirk
+
+# Custom OpenAPI configuration for JWT Bearer security
+
+@app.post(f"{API_BASE_PATH}/usage/batch", response_model=schemas.BatchResponse)
+async def create_usage_batch_tolerant(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db)
+):
+    """Accept usage batch in both mobile (items) and server (entries) formats"""
+    # Parse request body to handle both formats
+    try:
+        body_data = await request.json()
+        logging.warning("== /api/v1/usage/batch (TOLERANT) ==")
+        auth_status = "Bearer [REDACTED]" if credentials else "None"
+        logging.warning("Auth: %s", auth_status)
+        logging.warning("Body:\n%s", json.dumps(body_data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {str(e)}"
+        )
+    
+    # Unified device JWT authentication
+    device = await auth.verify_device_jwt_auth(db, credentials.credentials)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired device token"
+        )
+    
+    try:
+        raw_items = _extract_raw_usage_items(body_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    now = datetime.now(timezone.utc)
+    usage_entries, validation_errors = _collect_usage_entries(raw_items, now=now)
+
+    accepted_count = 0
+    duplicate_count = 0
+
+    if usage_entries:
+        try:
+            async with db.begin():
+                insert_result = await crud.create_usage_logs(
+                    db,
+                    device,
+                    usage_entries,
+                )
+                accepted_count = insert_result.accepted
+                duplicate_count = insert_result.duplicates
+                logging.warning(
+                    "Accepted %s usage entries (duplicates=%s) for device %s",
+                    accepted_count,
+                    duplicate_count,
+                    device.name,
+                )
+                if accepted_count:
+                    await crud.update_device_last_seen(
+                        db,
+                        device.id,
+                    )
+        except Exception as exc:
+            logging.exception("Failed to persist usage batch")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to process usage batch: {exc}",
+            )
+
+    rejected_count = len(validation_errors)
+    if rejected_count:
+        logging.warning(
+            "Rejected %s usage items for device %s", rejected_count, device.id
+        )
+
+    return schemas.BatchResponse(
+        accepted=accepted_count,
+        duplicates=duplicate_count,
+        rejected=rejected_count,
+        errors=validation_errors,
+    )
+
+
+@app.post(f"{API_BASE_PATH}/usage/validate", response_model=schemas.BatchResponse)
+
+@app.post(f"{API_BASE_PATH}/usage/validate", response_model=schemas.BatchResponse)
+async def validate_usage_batch(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate a usage payload without persisting it."""
+
+    try:
+        body_data = await request.json()
+        logging.debug("== /api/v1/usage/validate ==")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {exc}",
+        )
+
+    device = await auth.verify_device_jwt_auth(db, credentials.credentials)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired device token",
+        )
+
+    try:
+        raw_items = _extract_raw_usage_items(body_data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    entries, errors = _collect_usage_entries(raw_items, now=datetime.now(timezone.utc))
+    rejected_count = len(errors)
+
+    if rejected_count:
+        logging.debug(
+            "Validation rejected %s items for device %s", rejected_count, device.id
+        )
+
+    return schemas.BatchResponse(
+        accepted=len(entries),
+        duplicates=0,
+        rejected=rejected_count,
+        errors=errors,
+    )
+
+# Old desktop endpoint removed - now handled by routes_usage_desktop.py
+
+# Device self-lookup endpoint (mobile app needs this)
+@app.get(f"{API_BASE_PATH}/devices/me")
+
+@app.post(f"{API_BASE_PATH}/events")
+async def create_event(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db)
+):
+    """Accept device events like heartbeats"""
+    # Unified device JWT authentication
+    device = await auth.verify_device_jwt_auth(db, credentials.credentials)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired device token"
+        )
+    
+    # Parse event data
+    try:
+        event_data = await request.json()
+        logging.warning("== /api/v1/events ==")
+        logging.warning("Device: %s", device.name)
+        logging.warning("Event:\n%s", json.dumps(event_data, indent=2, ensure_ascii=False))
+        
+        # Update device last_seen_at
+        async with db.begin():
+            await crud.update_device_last_seen(db, device.id)
+        
+        return {"status": "ok", "received": True}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid event data: {str(e)}"
+        )
+
+# Stats endpoints
+@app.get(
+    f"{API_BASE_PATH}/stats/today", 
+    response_model=schemas.StatsResponse,
+    tags=["stats"],
+    summary="Get Today's Usage Statistics",
+    description="Get usage statistics for today - requires JWT authentication",
+    dependencies=[Depends(security)],
+    responses={401: {"description": "Invalid or expired access token"}}
+)
+
+@app.post(f"{API_BASE_PATH}/devices/{{device_id}}/events", response_model=schemas.EventsBatchResponse)
+@limiter.limit("120/minute")
+async def create_device_events(
+    device_id: str,
+    request: Request,
+    events_data: schemas.EventsBatchRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db)
+):
+    """Bulk events upload endpoint for usage tracking"""
+    # Unified device JWT authentication
+    device = await auth.verify_device_jwt_auth(db, credentials.credentials)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired device token"
+        )
+    
+    # Verify device_id matches authenticated device
+    if str(device.id) != device_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Device ID mismatch"
+        )
+    
+    accepted = 0
+    rejected = 0
+    errors = []
+    
+    # Process each event
+    for event in events_data.events:
+        try:
+            candidate_name = event.app_package or event.app_name
+            namespace, raw_ident, display_name = infer_alias_context(
+                device.platform, app_name=candidate_name, domain=event.domain
+            )
+            resolution = await resolve_app(
+                db,
+                namespace=namespace,
+                ident=raw_ident,
+                display_name=display_name,
+            )
+            alias_ident = resolution.alias.ident
+            domain_value = event.domain.strip().lower() if event.domain else None
+            usage_event = models.UsageEvent(
+                device_id=device.id,
+                app_id=resolution.app.app_id,
+                event_type=event.event_type,
+                app_name=resolution.app.display_name,
+                app_package=event.app_package or (event.app_name if namespace == "android" else event.app_package),
+                domain=domain_value,
+                window_title=event.window_title,
+                alias_namespace=namespace,
+                alias_ident=alias_ident,
+                duration_ms=event.duration_ms,
+                event_timestamp=event.event_timestamp,
+                event_metadata=json.dumps(event.metadata) if event.metadata else None
+            )
+            db.add(usage_event)
+            await db.commit()
+            accepted += 1
+        except Exception as e:
+            await db.rollback()
+            rejected += 1
+            errors.append(f"Event rejected: {str(e)}")
+
+    # Update device last_seen_at
+    async with db.begin():
+        await crud.update_device_last_seen(db, device.id)
+
+    return schemas.EventsBatchResponse(
+        accepted=accepted,
+        rejected=rejected,
+        errors=errors
+    )
+
+# Enhanced policy endpoint
+@app.get(f"{API_BASE_PATH}/devices/{{device_id}}/policy", response_model=schemas.DevicePolicy)
+````
+
+## backend/crud.py
+Persistence helpers used by the usage endpoints.
+````python
+async def update_device_last_seen(db: AsyncSession, device_id) -> None:
+    """Update device last_seen_at timestamp"""
+    from sqlalchemy import update
+
+    await db.execute(
+        update(Device)
+        .where(Device.id == device_id)
+        .values(last_seen_at=datetime.now(timezone.utc))
+    )
+
+async def upsert_usage_rows(
+    db: AsyncSession,
+    rows: Iterable[dict],
+) -> Tuple[int, int]:
+    """Insert usage rows with ON CONFLICT DO NOTHING.
+
+    Returns a tuple of (inserted_count, skipped_count).
+    """
+
+    rows = list(rows)
+    if not rows:
+        return 0, 0
+
+    stmt = (
+        pg_insert(UsageLog)
+        .values(rows)
+        .on_conflict_do_nothing(
+            index_elements=[
+                UsageLog.device_id,
+                UsageLog.app_package,
+                UsageLog.start,
+                UsageLog.end,
+            ]
+        )
+        .returning(UsageLog.id)
+    )
+
+    result = await db.execute(stmt)
+    inserted_ids = result.scalars().all()
+    inserted = len(inserted_ids)
+    skipped = len(rows) - inserted
+    return inserted, skipped
+
+async def create_usage_logs(
+    db: AsyncSession,
+    device: Device,
+    entries: List[UsageEntry],
+) -> UsageInsertResult:
+    """Insert or upsert usage logs. Returns count of accepted rows and duplicates."""
+
+    device_id = device.id
+    platform = (device.platform or "").strip().lower()
+
+    pending_rows: list[dict[str, object]] = []
+    pending_violations: list[PolicyViolation] = []
+
+    for entry in entries:
+        try:
+            namespace, raw_ident, display_name = infer_alias_context(
+                platform, app_name=entry.app_name, domain=entry.domain
+            )
+            resolution = await resolve_app(
+                db,
+                namespace=namespace,
+                ident=raw_ident,
+                display_name=display_name,
+            )
+            alias_ident = resolution.alias.ident
+            domain_value = entry.domain.strip().lower() if entry.domain else None
+            app_id = resolution.app.app_id
+
+            if app_id in policy_store.get_blocked_app_ids():
+                pending_violations.append(
+                    PolicyViolation(
+                        device_id=device_id,
+                        app_id=app_id,
+                        violation_type="blocked_app",
+                        app_name=resolution.app.display_name,
+                        app_package=entry.app_name if namespace == "android" else None,
+                        domain=domain_value,
+                        violation_details=None,
+                        violation_timestamp=datetime.now(timezone.utc),
+                    )
+                )
+                continue
+
+            pending_rows.append(
+                {
+                    "device_id": device_id,
+                    "app_id": app_id,
+                    "app_name": resolution.app.display_name,
+                    "app_package": entry.app_name if namespace == "android" else None,
+                    "app_label": entry.app_name if namespace not in {"web", "android"} else None,
+                    "alias_namespace": namespace,
+                    "alias_ident": alias_ident,
+                    "domain": domain_value,
+                    "start": entry.start,
+                    "end": entry.end,
+                    "duration": entry.duration,
+                }
+            )
+        except Exception:
+            logger.exception("Failed to prepare usage log", extra={"device_id": str(device_id)})
+            raise
+
+    if not pending_rows:
+        if pending_violations:
+            for violation in pending_violations:
+                db.add(violation)
+        return UsageInsertResult(accepted=0, duplicates=0)
+
+    if pending_violations:
+        for violation in pending_violations:
+            db.add(violation)
+
+    dialect_name = getattr(getattr(db.bind, "dialect", None), "name", "")
+
+    duplicates = 0
+    accepted = 0
+
+    if dialect_name == "postgresql":
+        inserted, duplicates = await upsert_usage_rows(db, pending_rows)
+        accepted = inserted
+
+    elif dialect_name == "sqlite":
+        for row in pending_rows:
+            stmt = select(UsageLog).where(
+                UsageLog.device_id == row["device_id"],
+                UsageLog.app_package == row["app_package"],
+                UsageLog.start == row["start"],
+                UsageLog.end == row["end"],
+            )
+            existing = (await db.execute(stmt)).scalar_one_or_none()
+            if existing:
+                duplicates += 1
+                existing.app_id = row["app_id"]
+                existing.app_name = row["app_name"]
+                existing.app_package = row["app_package"]
+                existing.app_label = row["app_label"]
+                existing.alias_namespace = row["alias_namespace"]
+                existing.alias_ident = row["alias_ident"]
+                existing.domain = row["domain"]
+                existing.end = row["end"]
+                existing.duration = row["duration"]
+            else:
+                db.add(UsageLog(**row))
+
+        accepted = len(pending_rows) - duplicates
+
+    else:
+        raise RuntimeError(f"Unsupported database dialect: {dialect_name}")
+
+    if not accepted:
+        accepted = len(pending_rows) - duplicates
+
+    return UsageInsertResult(accepted=accepted, duplicates=duplicates)
+````
+
+## backend/routes_usage_desktop.py
+Desktop usage batch endpoint (copied wholesale).
+````python
+from fastapi import APIRouter, Depends, HTTPException
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY, HTTP_403_FORBIDDEN
+from sqlalchemy.ext.asyncio import AsyncSession
+from backend.database import get_db
+from backend.schemas import DesktopUsageBatch, UsageEntry, BatchResponse
+from backend.auth import require_device
+from backend import crud
+import logging
+
+router = APIRouter()
+log = logging.getLogger("usage")
+
+
+@router.post("/api/v1/usage/batch/desktop")
+async def usage_batch_desktop(
+    batch: DesktopUsageBatch,
+    device=Depends(require_device),
+    db: AsyncSession = Depends(get_db)
+):
+    """Accept desktop batch usage logs with unified device JWT authentication."""
+    log.info("desktop batch device=%s entries=%d", device.id, len(batch.entries))
+
+    # Validate device_id matches authenticated device
+    if str(device.id) != str(batch.device_id):
+        raise HTTPException(HTTP_403_FORBIDDEN, "Device ID mismatch")
+
+    entries: list[UsageEntry] = []
+    for entry in batch.entries:
+        if entry.duration < 0 or entry.end < entry.start:
+            raise HTTPException(HTTP_422_UNPROCESSABLE_ENTITY, "Invalid duration or timestamps")
+
+        entries.append(
+            UsageEntry(
+                app_name=entry.app_name,
+                domain=None,
+                start=entry.start,
+                end=entry.end,
+                duration=entry.duration,
+            )
+        )
+
+    accepted = 0
+    duplicates = 0
+    if entries:
+        async with db.begin():
+            result = await crud.create_usage_logs(db, device, entries)
+            accepted = result.accepted
+            duplicates = result.duplicates
+            if accepted:
+                await crud.update_device_last_seen(db, device.id)
+        total_duration_mins = sum(e.duration for e in entries) // 60
+        log.info(
+            "desktop accepted=%d duplicates=%d device=%s total_mins=%d",
+            accepted,
+            duplicates,
+            device.id,
+            total_duration_mins,
+        )
+
+    return BatchResponse(accepted=accepted, duplicates=duplicates)
+````
+
+## backend/models.py
+ORM models that underpin the usage tracking flow.
+````python
+class App(Base):
+    """Canonical directory entry for an application or site."""
+
+    __tablename__ = "apps"
+
+    app_id = Column(String(128), primary_key=True)
+    display_name = Column(String(255), nullable=False)
+    category = Column(String(64), nullable=True)
+    icon_url = Column(Text, nullable=True)
+    icon_b64 = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    aliases = relationship("AppAlias", back_populates="app", cascade="all, delete-orphan")
+    usage_logs = relationship("UsageLog", back_populates="app")
+    usage_events = relationship("UsageEvent", back_populates="app")
+    hourly_usage = relationship("HourlyAggregate", back_populates="app")
+    violations = relationship("PolicyViolation", back_populates="app")
+
+class AppAlias(Base):
+    """Namespace-specific identifier that maps to a canonical app."""
+
+    __tablename__ = "app_aliases"
+    __table_args__ = (
+        UniqueConstraint("namespace", "ident", name="uq_app_alias_namespace_ident"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    app_id = Column(String(128), ForeignKey("apps.app_id", ondelete="CASCADE"), nullable=False, index=True)
+    namespace = Column(String(50), nullable=False, index=True)
+    ident = Column(String(255), nullable=False)
+    match_kind = Column(String(32), nullable=False, default="equals")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    details = Column(Text, nullable=True)
+
+    app = relationship("App", back_populates="aliases")
+
+class Device(Base):
+    """Device model for registered devices"""
+
+    __tablename__ = "devices"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    platform = Column(String(50), nullable=False)
+    name = Column(String(255), nullable=False)
+    device_key = Column(String(255), unique=True, nullable=True, index=True)
+    jwt_secret = Column(String(255), nullable=False, index=True)
+    hardware_fingerprint = Column(Text, nullable=True, index=True)
+    device_uid = Column(Text, nullable=True, unique=True, index=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    usage_logs = relationship("UsageLog", back_populates="device", cascade="all, delete-orphan")
+    usage_events = relationship("UsageEvent", back_populates="device", cascade="all, delete-orphan")
+    violations = relationship("PolicyViolation", back_populates="device", cascade="all, delete-orphan")
+    app_sessions = relationship("AppSession", back_populates="device", cascade="all, delete-orphan")
+
+class UsageLog(Base):
+    """Usage log model for tracking app usage"""
+
+    __tablename__ = "usage_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id = Column(UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False, index=True)
+    app_id = Column(String(128), ForeignKey("apps.app_id"), nullable=True, index=True)
+    app_name = Column(String(255), nullable=False)
+    app_package = Column(String(255), nullable=True, index=True)
+    app_label = Column(String(255), nullable=True)
+    alias_namespace = Column(String(50), nullable=True)
+    alias_ident = Column(String(255), nullable=True)
+    domain = Column(String(255), nullable=True)
+    start = Column(DateTime(timezone=True), nullable=False, index=True)
+    end = Column(DateTime(timezone=True), nullable=False)
+    duration = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    device = relationship("Device", back_populates="usage_logs")
+    app = relationship("App", back_populates="usage_logs")
+
+class UsageEvent(Base):
+    """Raw usage events from devices before aggregation"""
+
+    __tablename__ = "usage_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id = Column(UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False, index=True)
+    app_id = Column(String(128), ForeignKey("apps.app_id"), nullable=True, index=True)
+    event_type = Column(String(50), nullable=False)
+    app_name = Column(String(255), nullable=False, index=True)
+    app_package = Column(String(255), nullable=True)
+    domain = Column(String(255), nullable=True)
+    window_title = Column(String(500), nullable=True)
+    alias_namespace = Column(String(50), nullable=True)
+    alias_ident = Column(String(255), nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    event_timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    event_metadata = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    device = relationship("Device", back_populates="usage_events")
+    app = relationship("App", back_populates="usage_events")
+
+class AppSession(Base):
+    """Per-app session reported from mobile devices (screen-time / engaged sessions)"""
+    
+    __tablename__ = "app_sessions"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_id = Column(UUID(as_uuid=True), ForeignKey("devices.id"), nullable=False, index=True)
+    package = Column(String(255), nullable=False, index=True)
+    start_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    end_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    duration_ms = Column(Integer, nullable=False)
+    engaged_ms = Column(Integer, nullable=True)
+    interaction_count = Column(Integer, nullable=True)
+    screen_on_only = Column(Boolean, nullable=False, default=True)
+    source = Column(String(255), nullable=True)  # e.g. "usage_events+screen_state(+accessibility)"
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
+    device = relationship("Device", back_populates="app_sessions")
+````
