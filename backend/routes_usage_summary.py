@@ -1,118 +1,107 @@
-from typing import Optional
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from backend.database import get_db
-from backend.schemas import UsageSeries
 
 router = APIRouter(prefix="/api/v1/usage", tags=["usage"])
+
+
+def _parse_date(value: str):
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format '{value}'; use YYYY-MM-DD",
+        ) from exc
 
 
 @router.get("/summary")
 async def usage_summary(
     from_date: str = Query(..., alias="from"),
     to_date: str = Query(..., alias="to"),
+    account_id: str = Query("default"),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return a snapshot with:
-      - attention_minutes: global overlap-collapsed minutes
-      - device_minutes: array of { device_id, minutes } (per-device, overlaps collapsed per device)
-      - app_minutes: array of { app_package, minutes } (raw app totals)
-    Query params:
-      ?from=ISO&to=ISO
-    """
+    """Return rollup-backed attention metrics for the requested date range."""
+
+    start_date = _parse_date(from_date)
+    end_date = _parse_date(to_date)
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="`to` must be on or after `from`")
+
+    params = {
+        "account_id": account_id,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
     try:
-        sql = text(
+        attention_stmt = text(
             """
-WITH bounds AS (
-  SELECT :d0::timestamptz AS d0,
-         :d1::timestamptz AS d1
-),
-w AS (
-  SELECT u.device_id, u.app_package, u."start", u."end"
-  FROM usage_logs u, bounds b
-  WHERE u."start" >= b.d0 AND u."end" <= b.d1
-),
-
--- App totals (raw)
-app_totals AS (
-  SELECT app_package,
-         SUM(EXTRACT(EPOCH FROM ("end" - "start"))) AS seconds
-  FROM w GROUP BY app_package
-),
-
--- Device time (overlap-collapsed per device)
-dev_ordered AS (
-  SELECT device_id, "start", "end",
-         LAG("end") OVER (PARTITION BY device_id ORDER BY "start") AS prev_end
-  FROM w
-),
-dev_islands AS (
-  SELECT device_id, "start", "end",
-         SUM(CASE WHEN prev_end IS NULL OR "start" > prev_end THEN 1 ELSE 0 END)
-           OVER (PARTITION BY device_id ORDER BY "start") AS island_id
-  FROM dev_ordered
-),
-dev_merged AS (
-  SELECT device_id, MIN("start") AS m_start, MAX("end") AS m_end
-  FROM dev_islands GROUP BY device_id, island_id
-),
-
--- Attention time (global overlap-collapsed)
-glob_ordered AS (
-  SELECT "start", "end",
-         LAG("end") OVER (ORDER BY "start") AS prev_end
-  FROM w
-),
-glob_islands AS (
-  SELECT "start", "end",
-         SUM(CASE WHEN prev_end IS NULL OR "start" > prev_end THEN 1 ELSE 0 END)
-           OVER (ORDER BY "start") AS island_id
-  FROM glob_ordered
-),
-glob_merged AS (
-  SELECT MIN("start") AS m_start, MAX("end") AS m_end
-  FROM glob_islands GROUP BY island_id
-)
-
-SELECT
-  -- attention time (global)
-  (SELECT ROUND(COALESCE(SUM(EXTRACT(EPOCH FROM (m_end - m_start))),0)/60.0, 1) FROM glob_merged) AS attention_minutes,
-
-  -- device time (per device) as jsonb
-  (SELECT COALESCE(jsonb_agg(jsonb_build_object('device_id', device_id, 'minutes',
-    ROUND(SUM(EXTRACT(EPOCH FROM (m_end - m_start)))/60.0, 1)) ORDER BY SUM(EXTRACT(EPOCH FROM (m_end - m_start))) DESC), '[]'::jsonb)
-   FROM dev_merged GROUP BY device_id) AS device_minutes_json,
-
-  -- app totals as jsonb
-  (SELECT COALESCE(jsonb_agg(jsonb_build_object('app_package', app_package, 'minutes', ROUND(seconds/60.0, 1)) ORDER BY seconds DESC), '[]'::jsonb)
-   FROM app_totals) AS app_minutes_json
-LIMIT 1;
+            SELECT COALESCE(SUM(duration_seconds), 0) AS total_seconds
+            FROM attention_sessions_daily
+            WHERE account_id = :account_id
+              AND session_date BETWEEN :start_date AND :end_date
             """
         )
+        attention_seconds = (await db.execute(attention_stmt, params)).scalar_one()
 
-        params = {"d0": from_date, "d1": to_date}
-        result = await db.execute(sql, params)
-        row = result.fetchone()
-        if not row:
-            return {
-                "attention_minutes": 0.0,
-                "device_minutes": [],
-                "app_minutes": [],
+        device_stmt = text(
+            """
+            SELECT device_id::text AS device_id,
+                   SUM(duration_seconds) AS seconds
+            FROM device_sessions_daily
+            WHERE account_id = :account_id
+              AND session_date BETWEEN :start_date AND :end_date
+            GROUP BY device_id
+            ORDER BY seconds DESC
+            """
+        )
+        device_rows = await db.execute(device_stmt, params)
+        device_minutes = [
+            {
+                "device_id": row.device_id,
+                "minutes": round((row.seconds or 0) / 60.0, 1),
             }
+            for row in device_rows
+        ]
 
-        attention_minutes = float(row[0]) if row[0] is not None else 0.0
+        app_stmt = text(
+            """
+            SELECT
+                COALESCE(app_package, app_id, app_name, 'unknown') AS app_key,
+                MAX(app_package) AS app_package,
+                MAX(app_id) AS app_id,
+                MAX(app_name) AS app_name,
+                SUM(duration_seconds) AS seconds
+            FROM device_sessions_daily
+            WHERE account_id = :account_id
+              AND session_date BETWEEN :start_date AND :end_date
+            GROUP BY app_key
+            ORDER BY seconds DESC
+            """
+        )
+        app_rows = await db.execute(app_stmt, params)
+        app_minutes = []
+        for row in app_rows:
+            label = row.app_package or row.app_id or row.app_name or row.app_key
+            app_minutes.append(
+                {
+                    "app_package": label,
+                    "minutes": round((row.seconds or 0) / 60.0, 1),
+                }
+            )
 
-        # device_minutes_json may be repeated per-device group; coerce to a single array
-        device_json = row[1]
-        app_json = row[2]
-
-        # Ensure we return consistent shapes
         return {
-            "attention_minutes": attention_minutes,
-            "device_minutes": device_json or [],
-            "app_minutes": app_json or [],
+            "attention_minutes": round((attention_seconds or 0) / 60.0, 1),
+            "device_minutes": device_minutes,
+            "app_minutes": app_minutes,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to compute usage summary: {e}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to compute usage summary: {exc}") from exc

@@ -17,7 +17,26 @@ from backend.schemas import DeviceCreate, UsageEntry, DeviceInfo, StatsResponse,
 from collections import defaultdict
 from typing import Iterable, Tuple
 
+
 logger = logging.getLogger(__name__)
+
+_usage_upsert_index_ready = False
+
+async def _ensure_usage_upsert_index(db: AsyncSession) -> None:
+    """Ensure the partial unique index used by usage upsert exists."""
+    global _usage_upsert_index_ready
+    if _usage_upsert_index_ready:
+        return
+    stmt = text(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_session_start
+        ON usage_logs (device_id, app_package, start)
+        WHERE app_package IS NOT NULL
+        """
+    )
+    await db.execute(stmt)
+    _usage_upsert_index_ready = True
+
 
 def _merge_usage_points(points: List[UsagePoint]) -> List[UsagePoint]:
     """Merge usage points by timestamp, summing minutes and breakdowns"""
@@ -206,34 +225,44 @@ async def upsert_usage_rows(
     db: AsyncSession,
     rows: Iterable[dict],
 ) -> Tuple[int, int]:
-    """Insert usage rows with ON CONFLICT DO NOTHING.
+    """Insert usage rows with upsert semantics; extend sessions on conflict.
 
-    Returns a tuple of (inserted_count, skipped_count).
+    Returns a tuple of (inserted_count, updated_count).
     """
 
     rows = list(rows)
     if not rows:
         return 0, 0
 
-    stmt = (
-        pg_insert(UsageLog)
-        .values(rows)
-        .on_conflict_do_nothing(
-            index_elements=[
-                UsageLog.device_id,
-                UsageLog.app_package,
-                UsageLog.start,
-                UsageLog.end,
-            ]
-        )
-        .returning(UsageLog.id)
+    await _ensure_usage_upsert_index(db)
+
+    insert_stmt = pg_insert(UsageLog).values(rows)
+    excluded = insert_stmt.excluded
+    conflict_cols = [UsageLog.device_id, UsageLog.app_package, UsageLog.start]
+
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=conflict_cols,
+        set_={
+            "end": sa.func.GREATEST(UsageLog.end, excluded.end),
+            "duration": sa.func.GREATEST(UsageLog.duration, excluded.duration),
+            "app_id": excluded.app_id,
+            "app_name": excluded.app_name,
+            "app_package": excluded.app_package,
+            "app_label": excluded.app_label,
+            "alias_namespace": excluded.alias_namespace,
+            "alias_ident": excluded.alias_ident,
+            "domain": excluded.domain,
+        },
+    ).returning(
+        UsageLog.id,
+        sa.literal_column("xmax = 0").label("inserted"),
     )
 
-    result = await db.execute(stmt)
-    inserted_ids = result.scalars().all()
-    inserted = len(inserted_ids)
-    skipped = len(rows) - inserted
-    return inserted, skipped
+    result = await db.execute(upsert_stmt)
+    rows_out = result.all()
+    inserted = sum(1 for r in rows_out if r.inserted)
+    updated = len(rows_out) - inserted
+    return inserted, updated
 
 
 async def create_usage_logs(

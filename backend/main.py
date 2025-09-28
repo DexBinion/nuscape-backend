@@ -30,6 +30,7 @@ from backend.routes_usage_debug import router as usage_debug_router
 from backend.metrics import metrics
 from backend.redis_client import redis_client
 from backend.app_seeds import load_app_seeds
+from backend.rollups import run_daily_rollups, SESSION_GAP_SECONDS
 from pydantic import ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -42,6 +43,8 @@ logging.error(f"🔍 DEBUG: API_BASE_PATH set to: '{API_BASE_PATH}'")
 CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
 MAX_SESSION_DURATION = timedelta(hours=8)
 MIN_FOREGROUND_DURATION_MS = 5000
+
+ROLLUP_CRON_KEY = os.environ.get("ROLLUP_CRON_KEY") or settings.jwt_secret_key
 
 
 def _add_batch_error(errors: list[schemas.BatchItemError], index: int, message: str, code: str) -> None:
@@ -791,6 +794,40 @@ async def validate_usage_batch(
         rejected=rejected_count,
         errors=errors,
     )
+
+
+@app.post(f"{API_BASE_PATH}/usage/rollups/run")
+async def trigger_rollup_job(
+    date_str: Optional[str] = Query(None, alias="date"),
+    account_id: str = Query("default"),
+    gap_seconds: int = Query(SESSION_GAP_SECONDS, ge=30, le=600),
+    cron_key: Optional[str] = Header(None, alias="X-Cron-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    if ROLLUP_CRON_KEY and cron_key != ROLLUP_CRON_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid rollup key",
+        )
+
+    target_date = None
+    if date_str:
+        try:
+            target_date = datetime.fromisoformat(date_str).date()
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format; use YYYY-MM-DD",
+            )
+
+    result = await run_daily_rollups(
+        db,
+        target_date=target_date,
+        account_id=account_id,
+        gap_seconds=gap_seconds,
+    )
+    return {"ok": True, "result": result}
+
 
 # Old desktop endpoint removed - now handled by routes_usage_desktop.py
 
