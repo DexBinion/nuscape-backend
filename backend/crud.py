@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from backend import policy_store
 from backend.models import Device, UsageLog, UsageEvent, HourlyAggregate, PolicyViolation
@@ -22,20 +23,67 @@ logger = logging.getLogger(__name__)
 
 _usage_upsert_index_ready = False
 
-async def _ensure_usage_upsert_index(db: AsyncSession) -> None:
-    """Ensure the partial unique index used by usage upsert exists."""
+async def _dedupe_usage_log_conflicts(db: AsyncSession) -> int:
+    """Remove duplicate usage_log rows that block the partial unique index."""
+    delete_stmt = text("""
+        WITH ranked AS (
+            SELECT
+                id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY device_id, app_package, "start"
+                    ORDER BY "end" DESC, duration DESC, created_at DESC
+                ) AS rn
+            FROM usage_logs
+            WHERE app_package IS NOT NULL
+        )
+        DELETE FROM usage_logs
+        WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+    """)
+    delete_stmt = delete_stmt.execution_options(isolation_level="AUTOCOMMIT")
+    result = await db.execute(delete_stmt)
+    deleted = result.rowcount or 0
+
+    update_stmt = text("""
+        UPDATE usage_logs
+        SET duration = GREATEST(
+            1,
+            CAST(EXTRACT(EPOCH FROM ("end" - "start")) AS INTEGER)
+        )
+        WHERE app_package IS NOT NULL
+          AND "end" > "start"
+          AND (duration IS NULL OR duration <> CAST(EXTRACT(EPOCH FROM ("end" - "start")) AS INTEGER));
+    """)
+    update_stmt = update_stmt.execution_options(isolation_level="AUTOCOMMIT")
+    await db.execute(update_stmt)
+    return deleted
+
+
+async def ensure_usage_upsert_index(db: AsyncSession) -> None:
+    """Ensure the partial unique index used by usage upsert exists, cleaning duplicates if needed."""
     global _usage_upsert_index_ready
     if _usage_upsert_index_ready:
         return
-    stmt = text(
-        """
+
+    index_stmt = text("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_session_start
-        ON usage_logs (device_id, app_package, start)
+        ON usage_logs (device_id, app_package, "start")
         WHERE app_package IS NOT NULL
-        """
-    )
-    await db.execute(stmt)
-    _usage_upsert_index_ready = True
+    """)
+    index_stmt = index_stmt.execution_options(isolation_level="AUTOCOMMIT")
+
+    try:
+        await db.execute(index_stmt)
+        _usage_upsert_index_ready = True
+        return
+    except IntegrityError:
+        await db.rollback()
+        deleted = await _dedupe_usage_log_conflicts(db)
+        logger.warning(
+            "usage_logs duplicates removed to build unique index: %s rows deleted",
+            deleted
+        )
+        await db.execute(index_stmt)
+        _usage_upsert_index_ready = True
 
 
 def _merge_usage_points(points: List[UsagePoint]) -> List[UsagePoint]:
@@ -233,8 +281,6 @@ async def upsert_usage_rows(
     rows = list(rows)
     if not rows:
         return 0, 0
-
-    await _ensure_usage_upsert_index(db)
 
     insert_stmt = pg_insert(UsageLog).values(rows)
     excluded = insert_stmt.excluded

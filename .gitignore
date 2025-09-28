@@ -34,3 +34,8 @@ logs/
 
 # Local redis binaries / artifacts (not needed in repo)
 redis/
+
+# Windows agent build artifacts
+/windows-agent/target/
+/windows-agent/dist/
+

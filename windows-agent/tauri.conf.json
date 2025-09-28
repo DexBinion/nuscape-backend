@@ -1,0 +1,21 @@
+{
+  "package": {
+    "productName": "NuScape Agent",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "windows": [],
+    "systemTray": {
+      "iconPath": "icons/icon.ico"
+    },
+    "allowlist": {
+      "shell": {
+        "all": true
+      }
+    },
+    "bundle": {
+      "identifier": "com.nuscape.agent",
+      "active": false
+    }
+  }
+}

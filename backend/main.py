@@ -693,6 +693,7 @@ async def create_usage_batch_tolerant(
 
     if db.in_transaction():
         await db.commit()
+    await crud.ensure_usage_upsert_index(db)
 
     try:
         async with db.begin():
@@ -1129,14 +1130,14 @@ async def activate_focus_mode(focus_request: dict):
 async def download_windows_app():
     """Download Windows executable"""
     # Build instructions: Run build_simple.bat in python-tracker folder
-    # Then upload the dist/NuScapeTracker.exe to object storage
+    # Then upload the windows-agent/target/release/bundle/msi/NuScape Agent_* to object storage
     raise HTTPException(
         status_code=status.HTTP_200_OK,
         detail={
             "message": "Windows app ready for download!",
-            "build_instructions": "Run 'python-tracker/build_simple.bat' to create NuScapeTracker.exe",
-            "requirements": "Python 3.7+ required on build machine",
-            "output": "dist/NuScapeTracker.exe"
+            "build_instructions": "From 'windows-agent' run 'cargo tauri build --release'",
+            "requirements": "Rust stable toolchain (cargo + target) required on build machine",
+            "output": "windows-agent/target/release/bundle/msi/NuScape Agent_*"
         }
     )
 
@@ -1414,6 +1415,3 @@ async def spa_fallback_disabled(request: Request, full_path: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=5000, reload=True)
-
-
-
