@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use storage::{NetworkCounterStore, StoragePaths, UsageBatchStore};
 use tauri::{AppHandle, CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu};
-use tokio::task::JoinHandle;
+use tauri::async_runtime::{self, JoinHandle};
 use uploader::UsageUploader;
 
 struct AgentState {

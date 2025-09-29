@@ -4,7 +4,8 @@ use std::time::Duration as StdDuration;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use tauri::async_runtime;
+use tauri::async_runtime::JoinHandle;
 use tokio::time;
 use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::ProcessStatus::K32GetModuleBaseNameW;
@@ -128,7 +129,7 @@ impl SessionCollector {
 
     pub fn spawn_sampler(&self) -> JoinHandle<()> {
         let collector = self.clone();
-        tokio::spawn(async move {
+        async_runtime::spawn(async move {
             let mut interval = time::interval(StdDuration::from_millis(SAMPLE_INTERVAL_MS));
             loop {
                 interval.tick().await;

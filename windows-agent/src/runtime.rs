@@ -1,6 +1,6 @@
 ﻿use std::sync::Arc;
 
-use tokio::task::JoinHandle;
+use tauri::async_runtime::{self, JoinHandle};
 use tokio::time::{interval, sleep, Duration};
 
 use crate::collectors::sessions::SessionCollector;
@@ -32,7 +32,7 @@ impl AgentRuntime {
     pub fn spawn(self: Arc<Self>) -> Vec<JoinHandle<()>> {
         let sampler = self.sessions.clone().spawn_sampler();
         let manager = self.manager.clone();
-        let collect_handle = tokio::spawn(async move {
+        let collect_handle = async_runtime::spawn(async move {
             if let Err(err) = manager.collect_and_store() {
                 log::error!("usage collection failed: {err:?}");
             }
@@ -46,7 +46,7 @@ impl AgentRuntime {
         });
 
         let uploader = self.uploader.clone();
-        let upload_handle = tokio::spawn(async move {
+        let upload_handle = async_runtime::spawn(async move {
             if let Err(err) = uploader.upload_pending().await {
                 log::error!("usage upload failed: {err:?}");
             }
