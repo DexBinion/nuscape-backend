@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
@@ -9,7 +9,9 @@ use tauri::async_runtime::JoinHandle;
 use tokio::time;
 use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::ProcessStatus::K32GetModuleBaseNameW;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::models::UsageSession;
@@ -220,7 +222,11 @@ unsafe fn window_process_id(hwnd: HWND) -> u32 {
 
 fn query_process_image(pid: u32) -> Result<Option<String>> {
     let handle = unsafe {
-        match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        match OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        ) {
             Ok(handle) => handle,
             Err(_) => return Ok(None),
         }

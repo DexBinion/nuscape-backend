@@ -1,11 +1,13 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::ptr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::WIN32_ERROR;
-use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
+use windows::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+};
 use windows::Win32::NetworkManagement::Ndis::IF_OPER_STATUS;
 
 use crate::models::{NetworkCounters, NetworkDelta};

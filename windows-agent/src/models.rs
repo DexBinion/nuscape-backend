@@ -1,4 +1,4 @@
-﻿use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use uuid::Uuid;
@@ -125,7 +125,11 @@ impl UsageBatch {
                 } else {
                     Vec::new()
                 },
-                status: if include_meta { self.status.clone() } else { None },
+                status: if include_meta {
+                    self.status.clone()
+                } else {
+                    None
+                },
             };
 
             let mut payload_bytes = chunk.to_json_string()?.into_bytes().len();
@@ -138,7 +142,11 @@ impl UsageBatch {
                 } else {
                     Vec::new()
                 };
-                chunk.status = if include_meta { self.status.clone() } else { None };
+                chunk.status = if include_meta {
+                    self.status.clone()
+                } else {
+                    None
+                };
                 payload_bytes = chunk.to_json_string()?.into_bytes().len();
             }
 

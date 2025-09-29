@@ -1,4 +1,4 @@
-﻿use std::ptr;
+use std::ptr;
 
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
@@ -78,6 +78,8 @@ fn timezone_identifier() -> windows::core::Result<String> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(info.StandardName.len());
-        Ok(String::from_utf16_lossy(&info.StandardName[..len]).trim().to_string())
+        Ok(String::from_utf16_lossy(&info.StandardName[..len])
+            .trim()
+            .to_string())
     }
 }

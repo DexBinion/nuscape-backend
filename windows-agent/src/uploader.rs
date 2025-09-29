@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, Context, Result};
@@ -9,7 +9,10 @@ use tokio::time::sleep;
 
 use crate::auth::TokenStore;
 use crate::config::UsageConfigStore;
-use crate::models::{RequestOutcome, UploadFailureReason, UploadResult, DEFAULT_CHUNK_BYTE_LIMIT, DEFAULT_CHUNK_SESSION_LIMIT};
+use crate::models::{
+    RequestOutcome, UploadFailureReason, UploadResult, DEFAULT_CHUNK_BYTE_LIMIT,
+    DEFAULT_CHUNK_SESSION_LIMIT,
+};
 use crate::storage::UsageBatchStore;
 
 const USER_AGENT: &str = "NuScape-Windows-Agent/1.0";
@@ -27,9 +30,7 @@ impl UsageUploader {
         token_store: Arc<TokenStore>,
         batch_store: Arc<UsageBatchStore>,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .build()?;
+        let client = Client::builder().user_agent(USER_AGENT).build()?;
         Ok(Self {
             client,
             config_store,
@@ -124,8 +125,7 @@ impl UsageUploader {
             }
 
             if chunk_index == chunks.len() {
-                self
-                    .batch_store
+                self.batch_store
                     .pop()
                     .context("pop batch after success")?
                     .ok_or_else(|| anyhow!("batch disappeared before removal"))?;
@@ -163,9 +163,7 @@ impl UsageUploader {
                     }
                     let failure = if status.as_u16() == 401 {
                         UploadFailureReason::Unauthorized
-                    } else if status.as_u16() == 408
-                        || (500..=504).contains(&status.as_u16())
-                    {
+                    } else if status.as_u16() == 408 || (500..=504).contains(&status.as_u16()) {
                         UploadFailureReason::NetworkError
                     } else {
                         UploadFailureReason::ServerError
@@ -239,12 +237,8 @@ impl UsageUploader {
             .get("expires_in")
             .and_then(|v| v.as_i64())
             .unwrap_or(86_400);
-        self.token_store.save_tokens(
-            access.to_string(),
-            refresh_token,
-            expires,
-            Utc::now(),
-        )?;
+        self.token_store
+            .save_tokens(access.to_string(), refresh_token, expires, Utc::now())?;
         Ok(true)
     }
 }

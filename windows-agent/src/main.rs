@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
 mod collectors;
@@ -9,7 +9,7 @@ mod runtime;
 mod storage;
 mod uploader;
 
-use auth::TokenStore;
+use auth::{ensure_registered, TokenStore};
 use collectors::network::NetworkUsageCollector;
 use collectors::sessions::SessionCollector;
 use config::{DeviceIdStore, UsageConfigStore};
@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use storage::{NetworkCounterStore, StoragePaths, UsageBatchStore};
+use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu};
-use tauri::async_runtime::{self, JoinHandle};
 use uploader::UsageUploader;
 
 struct AgentState {
@@ -109,9 +109,7 @@ fn set_system_dns(adapter_name: &str) -> io::Result<()> {
         "interface ip set dns name=\"{}\" static 127.0.0.1",
         adapter_name
     );
-    let status = Command::new("netsh")
-        .args(cmd.split(' '))
-        .status()?;
+    let status = Command::new("netsh").args(cmd.split(' ')).status()?;
     if status.success() {
         log::info!("DNS set to 127.0.0.1 on \"{}\"", adapter_name);
         Ok(())
@@ -174,6 +172,12 @@ fn init_agent() -> anyhow::Result<Vec<JoinHandle<()>>> {
     let config_store = Arc::new(UsageConfigStore::new(&paths)?);
     let device_store = Arc::new(DeviceIdStore::new(&paths)?);
 
+    tauri::async_runtime::block_on(ensure_registered(
+        &config_store,
+        &token_store,
+        &device_store,
+    ))?;
+
     let session_collector = Arc::new(SessionCollector::new());
     let network_collector = Arc::new(NetworkUsageCollector::new(counter_store));
 
@@ -184,25 +188,15 @@ fn init_agent() -> anyhow::Result<Vec<JoinHandle<()>>> {
         batch_store.clone(),
     ));
 
-    let uploader = Arc::new(UsageUploader::new(
-        config_store,
-        token_store,
-        batch_store,
-    )?);
+    let uploader = Arc::new(UsageUploader::new(config_store, token_store, batch_store)?);
 
-    let runtime = Arc::new(AgentRuntime::new(
-        session_collector,
-        manager,
-        uploader,
-    ));
+    let runtime = Arc::new(AgentRuntime::new(session_collector, manager, uploader));
 
     Ok(runtime.spawn())
 }
 
 fn main() {
-    let _ = env_logger::builder()
-        .format_timestamp_secs()
-        .try_init();
+    let _ = env_logger::builder().format_timestamp_secs().try_init();
 
     tauri::Builder::default()
         .system_tray(build_tray())

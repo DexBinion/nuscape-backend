@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,7 +82,10 @@ impl UsageBatchStore {
 
     pub fn enqueue(&self, batch: UsageBatch) -> Result<()> {
         if !batch.size_fits() {
-            log::warn!("skipping oversized batch ({} sessions)", batch.sessions.len());
+            log::warn!(
+                "skipping oversized batch ({} sessions)",
+                batch.sessions.len()
+            );
             return Ok(());
         }
         let mut guard = self.queue.lock();

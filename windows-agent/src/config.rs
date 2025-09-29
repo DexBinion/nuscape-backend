@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
@@ -48,11 +48,9 @@ impl UsageConfigStore {
     }
 
     pub fn resolve_upload_config(&self) -> Result<UploadConfig> {
-        let base = self
-            .get_api_base()
-            .context("api base url not configured")?;
-        let mut base_url = reqwest::Url::parse(&base)
-            .or_else(|_| reqwest::Url::parse(&(base.clone() + "/")))?;
+        let base = self.get_api_base().context("api base url not configured")?;
+        let mut base_url =
+            reqwest::Url::parse(&base).or_else(|_| reqwest::Url::parse(&(base.clone() + "/")))?;
         if !base_url.path().ends_with('/') {
             base_url.set_path(&(base_url.path().to_string() + "/"));
         }
@@ -94,22 +92,31 @@ impl DeviceIdStore {
         })
     }
 
-    pub fn get_or_create(&self) -> Result<Uuid> {
-        let mut guard = self.cache.lock();
-        if let Some(record) = guard.as_mut() {
-            record.last_seen = Utc::now();
-            let serialized = serde_json::to_string_pretty(record)?;
-            fs::write(&self.path, serialized)?;
-            return Ok(record.device_id);
-        }
+    pub fn current(&self) -> Option<Uuid> {
+        self.cache.lock().as_ref().map(|record| record.device_id)
+    }
+
+    pub fn save(&self, device_id: Uuid) -> Result<()> {
         let record = DeviceRecord {
-            device_id: Uuid::new_v4(),
+            device_id,
             last_seen: Utc::now(),
         };
-        let device_id = record.device_id;
-        *guard = Some(record.clone());
         let serialized = serde_json::to_string_pretty(&record)?;
+        {
+            let mut guard = self.cache.lock();
+            *guard = Some(record);
+        }
         fs::write(&self.path, serialized)?;
-        Ok(device_id)
+        Ok(())
+    }
+
+    pub fn get_or_create(&self) -> Result<Uuid> {
+        if let Some(existing) = self.current() {
+            self.save(existing)?;
+            return Ok(existing);
+        }
+        let new_id = Uuid::new_v4();
+        self.save(new_id)?;
+        Ok(new_id)
     }
 }
