@@ -13,6 +13,8 @@ use auth::{ensure_registered, TokenStore};
 use collectors::network::NetworkUsageCollector;
 use collectors::sessions::SessionCollector;
 use config::{DeviceIdStore, UsageConfigStore};
+use serde::Deserialize;
+use std::env;
 use manager::UsageCollectionManager;
 use parking_lot::Mutex;
 use runtime::AgentRuntime;
@@ -133,6 +135,16 @@ fn setup_background(handle: &AppHandle) {
         }
     }
 
+    // Skip system DNS changes by default to avoid requiring Administrator privileges.
+    // To enable system DNS changes set NUSCAPE_SKIP_DNS=0 (or "false").
+    let enable_dns = std::env::var("NUSCAPE_SKIP_DNS")
+        .map(|v| matches!(v.as_str(), "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(false);
+    if !enable_dns {
+        log::info!("Skipping system DNS configuration by default; set NUSCAPE_SKIP_DNS=0 to enable");
+        return;
+    }
+
     match get_active_adapter_name() {
         Ok(Some(adapter)) => {
             if let Err(e) = set_system_dns(&adapter) {
@@ -164,12 +176,91 @@ fn on_tray_event(app: &AppHandle, event: SystemTrayEvent) {
     }
 }
 
+fn default_api_base() -> &'static str {
+    option_env!("NUSCAPE_DEFAULT_API_BASE").unwrap_or(
+        "https://nuscape-backend-dexterjk86.replit.app",
+    )
+}
+
+fn seed_api_base_if_missing(
+    config_store: &UsageConfigStore,
+    paths: &StoragePaths,
+) -> anyhow::Result<()> {
+    if config_store
+        .get_api_base()
+        .map(|base| !base.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let config_path = paths.config_path();
+
+    if let Ok(env_base) = env::var("NUSCAPE_API_BASE") {
+        let trimmed = env_base.trim();
+        if !trimmed.is_empty() {
+            config_store.set_api_base(trimmed)?;
+            log::info!(
+                "Seeded API base from NUSCAPE_API_BASE ({}).",
+                config_path.display()
+            );
+            return Ok(());
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct TemplateConfig {
+        #[serde(default)]
+        api_base: Option<String>,
+    }
+
+    const TEMPLATE: &str = include_str!("../resources/config.json");
+    match serde_json::from_str::<TemplateConfig>(TEMPLATE) {
+        Ok(template) => {
+            if let Some(base) = template.api_base.and_then(|value| {
+                let trimmed = value.trim().to_owned();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }) {
+                config_store.set_api_base(&base)?;
+                log::info!(
+                    "Seeded API base from bundled template ({}).",
+                    config_path.display()
+                );
+                return Ok(());
+            }
+        }
+        Err(err) => {
+            log::warn!("Bundled config template is invalid JSON: {err}");
+        }
+    }
+
+    let fallback = default_api_base();
+    if fallback.trim().is_empty() {
+        log::warn!("DEFAULT_API_BASE resolved to empty string; skipping seed");
+        return Ok(());
+    }
+
+    config_store.set_api_base(fallback)?;
+    log::warn!(
+        "No env or template API base found; using DEFAULT_API_BASE={} ({}).",
+        fallback,
+        config_path.display()
+    );
+    Ok(())
+}
+
+
 fn init_agent() -> anyhow::Result<Vec<JoinHandle<()>>> {
     let paths = StoragePaths::new()?;
     let batch_store = Arc::new(UsageBatchStore::new(&paths)?);
     let counter_store = Arc::new(NetworkCounterStore::new(&paths)?);
     let token_store = Arc::new(TokenStore::new(&paths)?);
     let config_store = Arc::new(UsageConfigStore::new(&paths)?);
+    seed_api_base_if_missing(config_store.as_ref(), &paths)?;
     let device_store = Arc::new(DeviceIdStore::new(&paths)?);
 
     tauri::async_runtime::block_on(ensure_registered(

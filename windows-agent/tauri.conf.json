@@ -1,7 +1,7 @@
 {
   "package": {
     "productName": "NuScape Agent",
-    "version": "1.0.0"
+    "version": "0.1.0"
   },
   "tauri": {
     "windows": [
@@ -9,7 +9,7 @@
         "title": "NuScape Agent",
         "width": 800,
         "height": 600,
-        "visible": false
+        "visible": true
       }
     ],
     "systemTray": {
@@ -17,19 +17,12 @@
     },
     "allowlist": {
       "shell": {
-        "all": true
+        "open": true
       }
-    },
-    "bundle": {
-      "active": true,
-      "identifier": "com.nuscape.agent",
-      "targets": [
-        "msi"
-      ],
-      "icon": [
-        "icons/icon.ico",
-        "icons/icon.png"
-      ]
     }
+  },
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": ""
   }
 }

@@ -1,11 +1,11 @@
-﻿[package]
+[package]
 name = "nuscape-agent-tauri"
 version = "0.1.0"
 edition = "2021"
 description = "NuScape Agent (Tauri)"
 
 [dependencies]
-tauri = { version = "1", features = ["system-tray", "shell-all"] }
+tauri = { version = "1", features = ["system-tray", "shell-open"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 once_cell = "1"
@@ -36,4 +36,4 @@ windows = { version = "0.57", features = [
 ] }
 
 [build-dependencies]
-tauri-build = { version = "1" }
+tauri-build = "1"
